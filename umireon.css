@@ -6,13 +6,16 @@
 
 :root {
   --umireon-color: #5fb2cb;
-}
-
-body {
   background-image: url("umireon-honeycomb-wallpaper.svg");
   background-position: -330px -200px;
 }
 
 img#avater {
   border: 6px solid var(--umireon-color);
+}
+
+@media (max-width: 500px) {
+  my-bio.fancy {
+    --link-font-size: 45px;
+  }
 }
