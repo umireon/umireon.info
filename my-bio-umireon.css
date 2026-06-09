@@ -1,0 +1,18 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Kaito Udagawa
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+:root {
+  --umireon-color: #5fb2cb;
+}
+
+body {
+  background-image: url("umireon-honeycomb-wallpaper.svg");
+  background-position: -330px -200px;
+}
+
+img#avater {
+  border: 6px solid var(--umireon-color);
+}
