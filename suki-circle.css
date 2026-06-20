@@ -57,6 +57,7 @@ suki-circle {
   display: grid;
   grid-template-rows: auto 1fr;
   min-height: 100dvh;
+  overscroll-behavior: none;
 }
 
 .suki-shell {
@@ -112,6 +113,8 @@ suki-circle {
   display: block;
   min-height: 0;
   position: relative;
+  overscroll-behavior: none;
+  touch-action: none;
   background:
     linear-gradient(#e7eeeb 1px, transparent 1px),
     linear-gradient(90deg, #e7eeeb 1px, transparent 1px),
@@ -128,7 +131,14 @@ suki-circle {
   overflow: hidden;
   background: transparent;
   touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
   cursor: grab;
+}
+
+.suki-canvas * {
+  touch-action: none;
 }
 
 .suki-canvas.is-panning {
