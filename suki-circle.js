@@ -68,6 +68,7 @@ const EXPORTED_SVG_STYLE = `
  * @property {string} documentId
  * @property {string} documentName
  * @property {SukiGraph} graph
+ * @property {{ centerX: number, centerY: number, scale: number } | null} viewport
  */
 
 /**
@@ -76,6 +77,14 @@ const EXPORTED_SVG_STYLE = `
  */
 function toHexByte(value) {
   return Math.round(value).toString(16).padStart(2, "0");
+}
+
+/**
+ * @param {number} value
+ * @returns {string}
+ */
+function formatCompactUrlNumber(value) {
+  return String(Math.round(value * 1000) / 1000);
 }
 
 /**
@@ -307,10 +316,19 @@ function readInitialStateFromUrlSearch(search) {
   /** @type {{ id: string, sourceId: string, targetId: string, label: string, color: string }[]} */
   const edgeEntries = [];
   let documentName = "スキサークル";
+  /** @type {{ centerX: number, centerY: number, scale: number } | null} */
+  let viewport = null;
 
   for (const [key, value] of entries) {
     if (key === "t") {
       documentName = value.trim() || documentName;
+      continue;
+    }
+    if (key === "p") {
+      const [centerX, centerY, scale] = value.split("_").map(Number);
+      if (Number.isFinite(centerX) && Number.isFinite(centerY) && Number.isFinite(scale) && scale > 0) {
+        viewport = { centerX, centerY, scale };
+      }
       continue;
     }
 
@@ -408,7 +426,7 @@ function readInitialStateFromUrlSearch(search) {
   });
 
   updateGroupGeometry(graph);
-  return { documentId: documentIdMatch ? `sc-${documentIdMatch[1]}` : "", documentName, graph };
+  return { documentId: documentIdMatch ? `sc-${documentIdMatch[1]}` : "", documentName, graph, viewport };
 }
 
 /**
@@ -423,15 +441,23 @@ function readInitialStateFromLocation() {
  * @param {SukiGraph} graph
  * @param {string} documentName
  * @param {string} documentId
+ * @param {{ centerX: number, centerY: number, scale: number } | null} [viewport]
  * @returns {string}
  */
-function createUrlQueryFromGraph(graph, documentName, documentId = "") {
+function createUrlQueryFromGraph(graph, documentName, documentId = "", viewport = null) {
   const sourceGraph = cloneGraph(graph);
   updateGroupGeometry(sourceGraph);
   const documentIdMatch = documentId.match(/^sc-([0-9a-zA-Z]{5})$/);
   const query = new URLSearchParams({ "suki-circle": documentIdMatch ? `v1_${documentIdMatch[1]}` : "v1" });
   const title = documentName.trim();
   if (title) query.set("t", title);
+  if (viewport) {
+    query.set("p", [
+      formatCompactUrlNumber(viewport.centerX),
+      formatCompactUrlNumber(viewport.centerY),
+      formatCompactUrlNumber(viewport.scale),
+    ].join("_"));
+  }
 
   for (const group of sourceGraph.groups) {
     query.set(`g.${group.id}`, "");
@@ -1665,12 +1691,20 @@ class SukiCircleElement extends HTMLElement {
 
     /** @type {{ documentName: string, graph: SukiGraph, selectedId: string | null, pendingConnectionId: string | null, visibleNodeActionId: string | null, viewBox: { x: number, y: number, width: number, height: number, initialized: boolean } }[]} */
     this.undoStack = [];
-    /** @type {{ id: string, startX: number, startY: number, previousX: number, previousY: number, previousTime: number, lastSpeed: number, startTime: number, entityX: number, entityY: number, memberStarts: { id: string, x: number, y: number }[], originalGroupId: string | null, originalGroupBox: { left: number, top: number, width: number, height: number } | null, groupBoxes: { id: string, left: number, top: number, width: number, height: number }[], proposedGroupNodeId: string | null, ejected: boolean, active: boolean, historySaved: boolean } | null} */
+    /** @type {{ pointerId: number, id: string, startX: number, startY: number, previousX: number, previousY: number, previousTime: number, lastSpeed: number, startTime: number, entityX: number, entityY: number, memberStarts: { id: string, x: number, y: number }[], originalGroupId: string | null, originalGroupBox: { left: number, top: number, width: number, height: number } | null, groupBoxes: { id: string, left: number, top: number, width: number, height: number }[], proposedGroupNodeId: string | null, ejected: boolean, active: boolean, historySaved: boolean } | null} */
     this.drag = null;
     /** @type {{ x: number, y: number, width: number, height: number, initialized: boolean }} */
     this.viewBox = { x: 0, y: 0, width: 0, height: 0, initialized: false };
-    /** @type {{ startX: number, startY: number, viewX: number, viewY: number, moved: boolean } | null} */
+    /** @type {{ centerX: number, centerY: number, scale: number } | null} */
+    this.pendingViewport = null;
+    /** @type {{ pointerId: number, startX: number, startY: number, viewX: number, viewY: number, moved: boolean } | null} */
     this.pan = null;
+    /** @type {Set<number>} */
+    this.activePointers = new Set();
+    /** @type {Map<number, { x: number, y: number }>} */
+    this.activePointerPositions = new Map();
+    /** @type {{ pointerIds: [number, number], previousDistance: number, previousMidpointX: number, previousMidpointY: number } | null} */
+    this.pinch = null;
     /** @type {{ x: number, y: number } | null} */
     this.addHint = null;
     this.suppressNextCanvasClick = false;
@@ -1693,6 +1727,7 @@ class SukiCircleElement extends HTMLElement {
     const urlInitialState = readInitialStateFromLocation();
     this.geometry = readGeometryAttributes(this);
     if (urlInitialState?.documentId) this.id = urlInitialState.documentId;
+    this.pendingViewport = urlInitialState?.viewport || null;
     this.documentName = urlInitialState?.documentName || this.readInitialDocumentNameFromMarkup();
     const initialGraph = urlInitialState?.graph || this.readInitialGraphFromMarkup();
     const presentationStyle = presentationStyleElement(this.geometry);
@@ -1716,6 +1751,11 @@ class SukiCircleElement extends HTMLElement {
               <g class="suki-node-actions"></g>
             </g>
           </svg>
+          <div class="suki-zoom-controls" aria-label="表示倍率">
+            <button type="button" data-action="zoom-in" aria-label="拡大">+</button>
+            <button class="suki-zoom-value" type="button" data-action="reset-view" aria-label="表示をリセット">100%</button>
+            <button type="button" data-action="zoom-out" aria-label="縮小">-</button>
+          </div>
           <div class="suki-node-editor" contenteditable="true" role="textbox" aria-label="文字編集" hidden></div>
           <input class="suki-node-color-input" type="color" data-action="node-color-picker" aria-label="色変更" />
           <dialog class="suki-properties-dialog" aria-label="プロパティ">
@@ -1738,6 +1778,9 @@ class SukiCircleElement extends HTMLElement {
               <button type="button" data-action="close-svg-preview" aria-label="閉じる">×</button>
             </div>
             <div class="suki-svg-preview-actions">
+              <button type="button" data-action="share-jpeg-preview">JPEG共有</button>
+              <button type="button" data-action="share-url">URL共有</button>
+              <button type="button" data-action="share-svg-preview">SVG共有</button>
               <button type="button" data-action="download-jpeg-preview">JPEG保存</button>
               <button type="button" data-action="download-html-preview">HTML保存</button>
               <button type="button" data-action="download-svg-preview">SVG保存</button>
@@ -1754,14 +1797,18 @@ class SukiCircleElement extends HTMLElement {
     this.addEventListener("click", this);
     this.addEventListener("input", this);
     this.addEventListener("pointerdown", this);
+    this.addEventListener("wheel", this, { passive: false });
+    this.addEventListener("touchmove", this, { passive: false });
+    this.addEventListener("gesturestart", this, { passive: false });
+    this.addEventListener("gesturechange", this, { passive: false });
+    this.addEventListener("gestureend", this, { passive: false });
+    window.addEventListener("keydown", this);
     window.addEventListener("pointermove", this);
     window.addEventListener("pointerup", this);
     window.addEventListener("pointercancel", this);
     window.addEventListener("popstate", this);
     window.addEventListener("hashchange", this);
-    this.resizeObserver = new ResizeObserver(() => {
-      this.updateCanvasViewBox();
-    });
+    this.resizeObserver = new ResizeObserver(() => this.updateCanvasViewBox());
     this.resizeObserver.observe(this.getCanvas());
     this.syncDocumentNameInput();
     this.render();
@@ -1808,12 +1855,21 @@ class SukiCircleElement extends HTMLElement {
   }
 
   disconnectedCallback() {
+    this.removeEventListener("wheel", this);
+    this.removeEventListener("touchmove", this);
+    this.removeEventListener("gesturestart", this);
+    this.removeEventListener("gesturechange", this);
+    this.removeEventListener("gestureend", this);
+    window.removeEventListener("keydown", this);
     window.removeEventListener("pointermove", this);
     window.removeEventListener("pointerup", this);
     window.removeEventListener("pointercancel", this);
     window.removeEventListener("popstate", this);
     window.removeEventListener("hashchange", this);
     this.resizeObserver?.disconnect();
+    this.activePointers.clear();
+    this.activePointerPositions.clear();
+    this.pinch = null;
     this.addHint = null;
   }
 
@@ -2013,27 +2069,84 @@ class SukiCircleElement extends HTMLElement {
     }
   }
 
-  updateCanvasViewBox() {
+  /**
+   * @param {{ reset?: boolean }} [options]
+   */
+  updateCanvasViewBox(options = {}) {
     const canvas = this.getCanvas();
     const width = Math.max(1, Math.round(canvas.clientWidth));
     const height = Math.max(1, Math.round(canvas.clientHeight));
 
-    if (!this.viewBox.initialized) {
-      this.viewBox.x = Math.max(0, (CANVAS_WORLD_WIDTH - width) / 2);
-      this.viewBox.y = Math.max(0, (CANVAS_WORLD_HEIGHT - height) / 2);
+    if (options.reset || !this.viewBox.initialized) {
+      const scale = this.pendingViewport ? Math.max(0.01, this.pendingViewport.scale) : 1;
+      this.viewBox.width = width / scale;
+      this.viewBox.height = height / scale;
+      if (this.pendingViewport) {
+        this.viewBox.x = this.pendingViewport.centerX - this.viewBox.width / 2;
+        this.viewBox.y = this.pendingViewport.centerY - this.viewBox.height / 2;
+      } else {
+        this.viewBox.x = Math.max(0, (CANVAS_WORLD_WIDTH - this.viewBox.width) / 2);
+        this.viewBox.y = Math.max(0, (CANVAS_WORLD_HEIGHT - this.viewBox.height) / 2);
+      }
+      this.pendingViewport = null;
       this.viewBox.initialized = true;
     } else {
       const centerX = this.viewBox.x + this.viewBox.width / 2;
       const centerY = this.viewBox.y + this.viewBox.height / 2;
-      this.viewBox.x = centerX - width / 2;
-      this.viewBox.y = centerY - height / 2;
+      this.viewBox.x = centerX - this.viewBox.width / 2;
+      this.viewBox.y = centerY - this.viewBox.height / 2;
     }
 
-    this.viewBox.width = width;
-    this.viewBox.height = height;
     this.viewBox.x = this.clampViewBoxX(this.viewBox.x);
     this.viewBox.y = this.clampViewBoxY(this.viewBox.y);
     this.applyCanvasViewBox();
+  }
+
+  /**
+   * @returns {{ centerX: number, centerY: number, scale: number } | null}
+   */
+  getViewportUrlState() {
+    const canvas = this.getCanvas();
+    if (!this.viewBox.initialized || !canvas.clientWidth) return null;
+    return {
+      centerX: this.viewBox.x + this.viewBox.width / 2,
+      centerY: this.viewBox.y + this.viewBox.height / 2,
+      scale: canvas.clientWidth / Math.max(1, this.viewBox.width),
+    };
+  }
+
+  resetNonGraphState() {
+    this.selectedId = null;
+    this.pendingConnectionId = null;
+    this.visibleNodeActionId = null;
+    this.pointerDownSelectedId = null;
+    this.suppressNextEntityClickId = null;
+    this.undoStack = [];
+    this.viewBox = { x: 0, y: 0, width: 0, height: 0, initialized: false };
+    this.pendingViewport = null;
+    this.drag = null;
+    this.pan = null;
+    this.activePointers.clear();
+    this.activePointerPositions.clear();
+    this.pinch = null;
+    this.addHint = null;
+    this.suppressNextCanvasClick = true;
+    this.lastCanvasTap = null;
+    this.editingNodeId = null;
+    this.lastNodeTap = null;
+    this.suppressNextClickAfterEditing = false;
+    const editor = this.getNodeEditor();
+    if (editor) {
+      editor.hidden = true;
+      editor.textContent = "";
+      editor.classList.remove("is-group-editor", "is-node-editor", "is-edge-editor");
+    }
+    const propertiesDialog = this.querySelector(".suki-properties-dialog");
+    if (propertiesDialog instanceof HTMLDialogElement && propertiesDialog.open) propertiesDialog.close();
+    const previewDialog = this.querySelector(".suki-svg-preview-dialog");
+    if (previewDialog instanceof HTMLDialogElement && previewDialog.open) previewDialog.close();
+    this.recreateCanvasNextRender = true;
+    this.render();
   }
 
   applyCanvasViewBox() {
@@ -2050,6 +2163,8 @@ class SukiCircleElement extends HTMLElement {
     workspace.style.setProperty("--suki-grid-size-y", `${gridSizeY}px`);
     workspace.style.setProperty("--suki-grid-x", `${(-this.viewBox.x * scaleX) % gridSizeX}px`);
     workspace.style.setProperty("--suki-grid-y", `${(-this.viewBox.y * scaleY) % gridSizeY}px`);
+    const zoomValue = this.querySelector(".suki-zoom-value");
+    if (zoomValue instanceof HTMLButtonElement) zoomValue.textContent = `${Math.round(scaleX * 100)}%`;
   }
 
   /**
@@ -2069,7 +2184,7 @@ class SukiCircleElement extends HTMLElement {
   }
 
   /**
-   * @param {PointerEvent} event
+   * @param {{ clientX: number, clientY: number }} event
    * @returns {{ x: number, y: number }}
    */
   getCanvasPoint(event) {
