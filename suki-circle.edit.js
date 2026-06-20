@@ -275,6 +275,8 @@ class SukiCircleEdit {
    */
   constructor(circleElement) {
     this.rootElement = circleElement;
+    /** @type {Map<string, Promise<{ blob: Blob, filename: string, type: string } | null>>} */
+    this.previewFileDataPromises = new Map();
   }
 
   /**
@@ -1304,12 +1306,14 @@ class SukiCircleEdit {
       title: root.documentName || "スキサークル",
       url,
     };
-    if (navigator.share && window.isSecureContext) {
+    if (navigator.share) {
       try {
         await navigator.share(shareData);
         return;
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
+        window.alert("共有を開始できませんでした。もう一度操作してください。");
+        return;
       }
     }
     if (await this.copyTextToClipboard(url)) {
@@ -1622,6 +1626,7 @@ class SukiCircleEdit {
     dialog.classList.remove("is-saving");
     dialog.removeAttribute("aria-busy");
     preview.replaceChildren(svg);
+    this.preparePreviewShareFiles();
     if (!dialog.open) dialog.showModal();
   }
 
@@ -1643,24 +1648,67 @@ class SukiCircleEdit {
     return { blob, filename: `${fileNameStem(root.documentName)}.svg` };
   }
 
+  preparePreviewShareFiles() {
+    const root = this.rootElement;
+    this.previewFileDataPromises.clear();
+    const actions = [
+      ["jpeg", "share-jpeg-preview", () => this.createJpegPreviewFileData()],
+      ["png", "share-png-preview", () => this.createPngPreviewFileData()],
+      ["svg", "share-svg-preview", async () => {
+        const { blob, filename } = this.createSvgPreviewFileData();
+        return { blob, filename, type: "image/svg+xml" };
+      }],
+      ["html", "share-html-preview", () => this.createReadonlyHtmlFileData()],
+    ];
+
+    for (const [key, action, createFileData] of actions) {
+      const button = root.querySelector(`[data-action="${action}"]`);
+      if (button instanceof HTMLButtonElement) button.disabled = true;
+      const promise = Promise.resolve()
+        .then(createFileData)
+        .catch(() => null)
+        .finally(() => {
+          if (button instanceof HTMLButtonElement) button.disabled = false;
+        });
+      this.previewFileDataPromises.set(/** @type {string} */ (key), promise);
+    }
+  }
+
+  /**
+   * @param {string} key
+   * @param {() => Promise<{ blob: Blob, filename: string, type: string } | null>} createFileData
+   * @returns {Promise<{ blob: Blob, filename: string, type: string } | null>}
+   */
+  async getPreviewFileData(key, createFileData) {
+    const existing = this.previewFileDataPromises.get(key);
+    if (existing) return existing;
+    const promise = createFileData();
+    this.previewFileDataPromises.set(key, promise);
+    return promise;
+  }
+
   downloadSvgPreview() {
     const { blob, filename } = this.createSvgPreviewFileData();
     this.downloadBlob(blob, filename);
   }
 
   async shareSvgPreview() {
-    const { blob, filename } = this.createSvgPreviewFileData();
-    if (await this.shareFile(blob, filename, "image/svg+xml")) return;
-    this.downloadBlob(blob, filename);
+    const fileData = await this.getPreviewFileData("svg", async () => {
+      const { blob, filename } = this.createSvgPreviewFileData();
+      return { blob, filename, type: "image/svg+xml" };
+    });
+    if (!fileData) return;
+    if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
+    this.downloadBlob(fileData.blob, fileData.filename);
   }
 
   /**
-   * @returns {Promise<{ blob: Blob, filename: string }>}
+   * @returns {Promise<{ blob: Blob, filename: string, type: string }>}
    */
   async createReadonlyHtmlFileData() {
     const root = this.rootElement;
     const blob = new Blob([await createReadonlyHtml(root.documentName || "スキサークル", this.toCircleMarkup())], { type: "text/html" });
-    return { blob, filename: `${fileNameStem(root.documentName)}.html` };
+    return { blob, filename: `${fileNameStem(root.documentName)}.html`, type: "text/html" };
   }
 
   async downloadReadonlyHtml() {
@@ -1669,9 +1717,10 @@ class SukiCircleEdit {
   }
 
   async shareHtmlPreview() {
-    const { blob, filename } = await this.createReadonlyHtmlFileData();
-    if (await this.shareFile(blob, filename, "text/html")) return;
-    this.downloadBlob(blob, filename);
+    const fileData = await this.getPreviewFileData("html", () => this.createReadonlyHtmlFileData());
+    if (!fileData) return;
+    if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
+    this.downloadBlob(fileData.blob, fileData.filename);
   }
 
   /**
@@ -1679,7 +1728,7 @@ class SukiCircleEdit {
    * @param {string} extension
    * @param {number | undefined} quality
    * @param {string | null} background
-   * @returns {Promise<{ blob: Blob, filename: string } | null>}
+   * @returns {Promise<{ blob: Blob, filename: string, type: string } | null>}
    */
   async createRasterPreviewFileData(type, extension, quality, background) {
     const root = this.rootElement;
@@ -1702,18 +1751,18 @@ class SukiCircleEdit {
     context.drawImage(image, 0, 0, width, height);
     const imageBlob = await canvasToBlob(canvas, type, quality);
     if (!imageBlob) return null;
-    return { blob: imageBlob, filename: `${fileNameStem(root.documentName)}.${extension}` };
+    return { blob: imageBlob, filename: `${fileNameStem(root.documentName)}.${extension}`, type };
   }
 
   /**
-   * @returns {Promise<{ blob: Blob, filename: string } | null>}
+   * @returns {Promise<{ blob: Blob, filename: string, type: string } | null>}
    */
   async createJpegPreviewFileData() {
     return this.createRasterPreviewFileData("image/jpeg", "jpg", 0.9, "#ffffff");
   }
 
   /**
-   * @returns {Promise<{ blob: Blob, filename: string } | null>}
+   * @returns {Promise<{ blob: Blob, filename: string, type: string } | null>}
    */
   async createPngPreviewFileData() {
     return this.createRasterPreviewFileData("image/png", "png", undefined, null);
@@ -1726,9 +1775,9 @@ class SukiCircleEdit {
   }
 
   async shareJpegPreview() {
-    const fileData = await this.createJpegPreviewFileData();
+    const fileData = await this.getPreviewFileData("jpeg", () => this.createJpegPreviewFileData());
     if (!fileData) return;
-    if (await this.shareFile(fileData.blob, fileData.filename, "image/jpeg")) return;
+    if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
     this.downloadBlob(fileData.blob, fileData.filename);
   }
 
@@ -1739,9 +1788,9 @@ class SukiCircleEdit {
   }
 
   async sharePngPreview() {
-    const fileData = await this.createPngPreviewFileData();
+    const fileData = await this.getPreviewFileData("png", () => this.createPngPreviewFileData());
     if (!fileData) return;
-    if (await this.shareFile(fileData.blob, fileData.filename, "image/png")) return;
+    if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
     this.downloadBlob(fileData.blob, fileData.filename);
   }
 
@@ -1752,7 +1801,7 @@ class SukiCircleEdit {
    * @returns {Promise<boolean>}
    */
   async shareFile(blob, filename, type) {
-    if (!navigator.share || !window.isSecureContext) return false;
+    if (!navigator.share) return false;
     const file = new File([blob], filename, { type });
     const shareData = {
       title: this.rootElement.documentName || "スキサークル",
@@ -1763,7 +1812,9 @@ class SukiCircleEdit {
       await navigator.share(shareData);
       return true;
     } catch (error) {
-      return error instanceof DOMException && error.name === "AbortError";
+      if (error instanceof DOMException && error.name === "AbortError") return true;
+      window.alert("共有を開始できませんでした。もう一度操作してください。");
+      return true;
     }
   }
 
