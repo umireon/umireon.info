@@ -17,7 +17,6 @@ const staticFiles = [
   "suki-circle.edit.js",
   "suki-circle.html",
   "suki-circle.js",
-  "suki-circle.min.html",
   "suki-circle.nav.js",
   "umireon-avatar.webp",
   "umireon-honeycomb-wallpaper.svg",
