@@ -211,7 +211,7 @@ const loadImage = (url) => {
 /**
  * @param {HTMLCanvasElement} canvas
  * @param {string} type
- * @param {number} quality
+ * @param {number | undefined} quality
  * @returns {Promise<Blob | null>}
  */
 const canvasToBlob = (canvas, type, quality) => {
@@ -350,23 +350,18 @@ class SukiCircleEdit {
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "download-svg-preview") {
-      this.downloadSvgPreview();
-      return;
-    }
-
     if (actionButton instanceof Element && actionButton.dataset.action === "share-svg-preview") {
       void this.shareSvgPreview();
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "download-html-preview") {
-      this.downloadReadonlyHtml();
+    if (actionButton instanceof Element && actionButton.dataset.action === "share-html-preview") {
+      void this.shareHtmlPreview();
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "download-jpeg-preview") {
-      this.downloadJpegPreview();
+    if (actionButton instanceof Element && actionButton.dataset.action === "share-png-preview") {
+      void this.sharePngPreview();
       return;
     }
 
@@ -1659,41 +1654,69 @@ class SukiCircleEdit {
     this.downloadBlob(blob, filename);
   }
 
-  async downloadReadonlyHtml() {
+  /**
+   * @returns {Promise<{ blob: Blob, filename: string }>}
+   */
+  async createReadonlyHtmlFileData() {
     const root = this.rootElement;
     const blob = new Blob([await createReadonlyHtml(root.documentName || "スキサークル", this.toCircleMarkup())], { type: "text/html" });
-    this.downloadBlob(blob, `${fileNameStem(root.documentName)}.html`);
+    return { blob, filename: `${fileNameStem(root.documentName)}.html` };
+  }
+
+  async downloadReadonlyHtml() {
+    const { blob, filename } = await this.createReadonlyHtmlFileData();
+    this.downloadBlob(blob, filename);
+  }
+
+  async shareHtmlPreview() {
+    const { blob, filename } = await this.createReadonlyHtmlFileData();
+    if (await this.shareFile(blob, filename, "text/html")) return;
+    this.downloadBlob(blob, filename);
+  }
+
+  /**
+   * @param {string} type
+   * @param {string} extension
+   * @param {number | undefined} quality
+   * @param {string | null} background
+   * @returns {Promise<{ blob: Blob, filename: string } | null>}
+   */
+  async createRasterPreviewFileData(type, extension, quality, background) {
+    const root = this.rootElement;
+    const previewSvg = root.querySelector(".suki-svg-preview svg");
+    const svg = previewSvg instanceof SVGSVGElement ? /** @type {SVGSVGElement} */ (previewSvg.cloneNode(true)) : this.toSvgDocument();
+    const source = prettyPrintSvg(new XMLSerializer().serializeToString(svg));
+    const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`;
+    const image = await loadImage(url);
+    const width = Math.max(1, Math.ceil(Number(svg.getAttribute("width")) || image.naturalWidth || image.width));
+    const height = Math.max(1, Math.ceil(Number(svg.getAttribute("height")) || image.naturalHeight || image.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) return null;
+    if (background) {
+      context.fillStyle = background;
+      context.fillRect(0, 0, width, height);
+    }
+    context.drawImage(image, 0, 0, width, height);
+    const imageBlob = await canvasToBlob(canvas, type, quality);
+    if (!imageBlob) return null;
+    return { blob: imageBlob, filename: `${fileNameStem(root.documentName)}.${extension}` };
   }
 
   /**
    * @returns {Promise<{ blob: Blob, filename: string } | null>}
    */
   async createJpegPreviewFileData() {
-    const root = this.rootElement;
-    const previewSvg = root.querySelector(".suki-svg-preview svg");
-    const svg = previewSvg instanceof SVGSVGElement ? /** @type {SVGSVGElement} */ (previewSvg.cloneNode(true)) : this.toSvgDocument();
-    const source = prettyPrintSvg(new XMLSerializer().serializeToString(svg));
-    const blob = new Blob([source], { type: "image/svg+xml" });
-    const url = URL.createObjectURL(blob);
-    try {
-      const image = await loadImage(url);
-      const width = Math.max(1, Math.ceil(Number(svg.getAttribute("width")) || image.naturalWidth || image.width));
-      const height = Math.max(1, Math.ceil(Number(svg.getAttribute("height")) || image.naturalHeight || image.height));
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d");
-      if (!context) return null;
-      context.fillStyle = "#ffffff";
-      context.fillRect(0, 0, width, height);
-      context.drawImage(image, 0, 0, width, height);
-      const jpegBlob = await canvasToBlob(canvas, "image/jpeg", 0.9);
-      if (!jpegBlob) return null;
-      return { blob: jpegBlob, filename: `${fileNameStem(root.documentName)}.jpg` };
-    } finally {
-      URL.revokeObjectURL(url);
-    }
-    return null;
+    return this.createRasterPreviewFileData("image/jpeg", "jpg", 0.9, "#ffffff");
+  }
+
+  /**
+   * @returns {Promise<{ blob: Blob, filename: string } | null>}
+   */
+  async createPngPreviewFileData() {
+    return this.createRasterPreviewFileData("image/png", "png", undefined, null);
   }
 
   async downloadJpegPreview() {
@@ -1706,6 +1729,19 @@ class SukiCircleEdit {
     const fileData = await this.createJpegPreviewFileData();
     if (!fileData) return;
     if (await this.shareFile(fileData.blob, fileData.filename, "image/jpeg")) return;
+    this.downloadBlob(fileData.blob, fileData.filename);
+  }
+
+  async downloadPngPreview() {
+    const fileData = await this.createPngPreviewFileData();
+    if (!fileData) return;
+    this.downloadBlob(fileData.blob, fileData.filename);
+  }
+
+  async sharePngPreview() {
+    const fileData = await this.createPngPreviewFileData();
+    if (!fileData) return;
+    if (await this.shareFile(fileData.blob, fileData.filename, "image/png")) return;
     this.downloadBlob(fileData.blob, fileData.filename);
   }
 
