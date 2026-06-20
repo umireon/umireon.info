@@ -285,7 +285,7 @@ class SukiCircleEdit {
     if (event.type === "input") this.onInput(event);
     if (event.type === "pointerdown") this.onPointerDown(event);
     if (event.type === "pointermove") this.onPointerMove(event);
-    if (event.type === "pointerup") this.onPointerUp(event);
+    if (event.type === "pointerup" || event.type === "pointercancel") this.onPointerUp(event);
   }
 
   /**
@@ -714,11 +714,13 @@ class SukiCircleEdit {
     const root = this.rootElement;
     const pointer = /** @type {PointerEvent} */ (event);
     if (root.pan) {
+      pointer.preventDefault();
       this.applyCanvasPan(pointer.clientX, pointer.clientY);
       return;
     }
     if (!root.drag) return;
 
+    pointer.preventDefault();
     this.applyDragUpdate(pointer.clientX, pointer.clientY);
   }
 

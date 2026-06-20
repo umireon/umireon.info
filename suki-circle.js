@@ -1756,6 +1756,7 @@ class SukiCircleElement extends HTMLElement {
     this.addEventListener("pointerdown", this);
     window.addEventListener("pointermove", this);
     window.addEventListener("pointerup", this);
+    window.addEventListener("pointercancel", this);
     window.addEventListener("popstate", this);
     window.addEventListener("hashchange", this);
     this.resizeObserver = new ResizeObserver(() => {
@@ -1809,6 +1810,7 @@ class SukiCircleElement extends HTMLElement {
   disconnectedCallback() {
     window.removeEventListener("pointermove", this);
     window.removeEventListener("pointerup", this);
+    window.removeEventListener("pointercancel", this);
     window.removeEventListener("popstate", this);
     window.removeEventListener("hashchange", this);
     this.resizeObserver?.disconnect();
