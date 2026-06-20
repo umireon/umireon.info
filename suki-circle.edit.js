@@ -277,6 +277,8 @@ class SukiCircleEdit {
     this.rootElement = circleElement;
     /** @type {Map<string, Promise<{ blob: Blob, filename: string, type: string } | null>>} */
     this.previewFileDataPromises = new Map();
+    /** @type {Map<string, { blob: Blob, filename: string, type: string }>} */
+    this.previewFileData = new Map();
   }
 
   /**
@@ -1651,6 +1653,7 @@ class SukiCircleEdit {
   preparePreviewShareFiles() {
     const root = this.rootElement;
     this.previewFileDataPromises.clear();
+    this.previewFileData.clear();
     const actions = [
       ["jpeg", "share-jpeg-preview", () => this.createJpegPreviewFileData()],
       ["png", "share-png-preview", () => this.createPngPreviewFileData()],
@@ -1666,9 +1669,13 @@ class SukiCircleEdit {
       if (button instanceof HTMLButtonElement) button.disabled = true;
       const promise = Promise.resolve()
         .then(createFileData)
+        .then((fileData) => {
+          if (fileData) this.previewFileData.set(/** @type {string} */ (key), fileData);
+          return fileData;
+        })
         .catch(() => null)
         .finally(() => {
-          if (button instanceof HTMLButtonElement) button.disabled = false;
+          if (button instanceof HTMLButtonElement) button.disabled = !this.previewFileData.has(/** @type {string} */ (key));
         });
       this.previewFileDataPromises.set(/** @type {string} */ (key), promise);
     }
@@ -1676,15 +1683,10 @@ class SukiCircleEdit {
 
   /**
    * @param {string} key
-   * @param {() => Promise<{ blob: Blob, filename: string, type: string } | null>} createFileData
-   * @returns {Promise<{ blob: Blob, filename: string, type: string } | null>}
+   * @returns {{ blob: Blob, filename: string, type: string } | null}
    */
-  async getPreviewFileData(key, createFileData) {
-    const existing = this.previewFileDataPromises.get(key);
-    if (existing) return existing;
-    const promise = createFileData();
-    this.previewFileDataPromises.set(key, promise);
-    return promise;
+  getPreparedPreviewFileData(key) {
+    return this.previewFileData.get(key) || null;
   }
 
   downloadSvgPreview() {
@@ -1693,10 +1695,7 @@ class SukiCircleEdit {
   }
 
   async shareSvgPreview() {
-    const fileData = await this.getPreviewFileData("svg", async () => {
-      const { blob, filename } = this.createSvgPreviewFileData();
-      return { blob, filename, type: "image/svg+xml" };
-    });
+    const fileData = this.getPreparedPreviewFileData("svg");
     if (!fileData) return;
     if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
     this.downloadBlob(fileData.blob, fileData.filename);
@@ -1717,7 +1716,7 @@ class SukiCircleEdit {
   }
 
   async shareHtmlPreview() {
-    const fileData = await this.getPreviewFileData("html", () => this.createReadonlyHtmlFileData());
+    const fileData = this.getPreparedPreviewFileData("html");
     if (!fileData) return;
     if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
     this.downloadBlob(fileData.blob, fileData.filename);
@@ -1775,7 +1774,7 @@ class SukiCircleEdit {
   }
 
   async shareJpegPreview() {
-    const fileData = await this.getPreviewFileData("jpeg", () => this.createJpegPreviewFileData());
+    const fileData = this.getPreparedPreviewFileData("jpeg");
     if (!fileData) return;
     if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
     this.downloadBlob(fileData.blob, fileData.filename);
@@ -1788,7 +1787,7 @@ class SukiCircleEdit {
   }
 
   async sharePngPreview() {
-    const fileData = await this.getPreviewFileData("png", () => this.createPngPreviewFileData());
+    const fileData = this.getPreparedPreviewFileData("png");
     if (!fileData) return;
     if (await this.shareFile(fileData.blob, fileData.filename, fileData.type)) return;
     this.downloadBlob(fileData.blob, fileData.filename);
