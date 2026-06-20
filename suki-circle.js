@@ -1778,12 +1778,11 @@ class SukiCircleElement extends HTMLElement {
               <button type="button" data-action="close-svg-preview" aria-label="閉じる">×</button>
             </div>
             <div class="suki-svg-preview-actions">
-              <button type="button" data-action="share-jpeg-preview">JPEG共有</button>
+              <button type="button" data-action="share-jpeg-preview">JPEG</button>
+              <button type="button" data-action="share-png-preview">PNG</button>
+              <button type="button" data-action="share-svg-preview">SVG</button>
+              <button type="button" data-action="share-html-preview">HTML</button>
               <button type="button" data-action="share-url">URL共有</button>
-              <button type="button" data-action="share-svg-preview">SVG共有</button>
-              <button type="button" data-action="download-jpeg-preview">JPEG保存</button>
-              <button type="button" data-action="download-html-preview">HTML保存</button>
-              <button type="button" data-action="download-svg-preview">SVG保存</button>
             </div>
             <div class="suki-svg-preview"></div>
           </dialog>
