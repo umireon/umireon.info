@@ -28,7 +28,9 @@ select {
   display: none !important;
 }
 
-suki-circle > suki-graph {
+suki-circle > section,
+suki-circle > suki-node,
+suki-circle > suki-edge {
   display: none;
 }
 
@@ -36,13 +38,10 @@ button {
   min-height: 2.25rem;
   border: 1px solid #bdc9c4;
   border-radius: 0.4rem;
+  padding: 0.35rem 0.7rem;
   background: #ffffff;
   color: #172026;
   cursor: pointer;
-}
-
-button {
-  padding: 0.35rem 0.7rem;
 }
 
 button:hover {
@@ -55,7 +54,8 @@ button.is-active {
 }
 
 suki-circle {
-  display: block;
+  display: grid;
+  grid-template-rows: auto 1fr;
   min-height: 100dvh;
 }
 
@@ -76,11 +76,14 @@ suki-circle {
 }
 
 .suki-document-name {
-  min-inline-size: min(18rem, 45vw);
-  border: 1px solid transparent;
-  border-radius: 2px;
-  padding: 0.25rem 0.35rem;
-  background: transparent;
+  field-sizing: content;
+  inline-size: auto;
+  min-inline-size: 9rem;
+  max-inline-size: min(28rem, 62vw);
+  border: 1.5px solid #bdc9c4;
+  border-radius: 0.35rem;
+  padding: 0.35rem 0.65rem;
+  background: #ffffff;
   color: #172026;
   font: inherit;
   font-size: 1.1rem;
@@ -88,41 +91,42 @@ suki-circle {
 }
 
 .suki-document-name:focus {
-  border-color: #8fb6ad;
-  background: #ffffff;
+  border-color: #397b8f;
+  box-shadow: 0 0 0 0.2rem rgb(95 178 203 / 0.22);
   outline: none;
 }
 
 .suki-node-color-input {
   position: fixed;
-  left: 0;
   top: 0;
+  left: 0;
   opacity: 0.01;
   pointer-events: none;
 }
 
 .suki-workspace {
-  display: block;
-  min-height: 0;
-  position: relative;
-}
-
-.suki-canvas {
   --suki-grid-size-x: 32px;
   --suki-grid-size-y: 32px;
   --suki-grid-x: 0px;
   --suki-grid-y: 0px;
   display: block;
-  inline-size: 100%;
-  block-size: 100%;
-  min-height: calc(100dvh - 4rem);
-  overflow: hidden;
+  min-height: 0;
+  position: relative;
   background:
     linear-gradient(#e7eeeb 1px, transparent 1px),
     linear-gradient(90deg, #e7eeeb 1px, transparent 1px),
     #f8fbfa;
   background-position: var(--suki-grid-x) var(--suki-grid-y);
   background-size: var(--suki-grid-size-x) var(--suki-grid-size-y);
+}
+
+.suki-canvas {
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  min-height: calc(100dvh - 4rem);
+  overflow: hidden;
+  background: transparent;
   touch-action: none;
   cursor: grab;
 }
@@ -170,10 +174,7 @@ suki-circle {
   pointer-events: none;
 }
 
-.suki-node-actions {
-  pointer-events: none;
-}
-
+.suki-node-actions,
 .suki-edge-labels {
   pointer-events: none;
 }
@@ -214,11 +215,6 @@ suki-circle {
 
 .suki-add-hint-disc {
   fill: rgb(23 32 38 / 0.68);
-}
-
-.suki-add-hint-plus {
-  fill: #ffffff;
-  pointer-events: none;
 }
 
 @keyframes suki-node-action-fade-in {
@@ -439,6 +435,11 @@ suki-circle {
   stroke-width: 3.5;
 }
 
+.suki-add-hint-plus {
+  fill: #ffffff;
+  pointer-events: none;
+}
+
 .suki-node-delete-action:hover .suki-node-delete-action-circle {
   fill: #e88f86;
   stroke: #c96d64;
@@ -498,6 +499,10 @@ suki-circle {
   inline-size: min(72rem, calc(100vw - 2rem));
 }
 
+.suki-svg-preview-dialog.is-saving .suki-svg-preview-actions {
+  visibility: hidden;
+}
+
 .suki-properties-dialog::backdrop,
 .suki-svg-preview-dialog::backdrop {
   background: rgb(23 32 38 / 0.22);
@@ -531,13 +536,7 @@ suki-circle {
   gap: 0.85rem;
 }
 
-.suki-form label {
-  display: grid;
-  gap: 0.3rem;
-  color: #40504b;
-  font-size: 0.9rem;
-}
-
+.suki-form label,
 .suki-id-field {
   display: grid;
   gap: 0.3rem;
@@ -552,6 +551,25 @@ suki-circle {
   user-select: text;
 }
 
+.suki-form input,
+.suki-form select {
+  min-width: 0;
+  border: 1px solid #bdc9c4;
+  border-radius: 0.35rem;
+  padding: 0.45rem;
+  background: #ffffff;
+}
+
+.suki-form input[type="color"] {
+  padding: 0.1rem;
+  block-size: 2.4rem;
+}
+
+.suki-form button[data-action="delete"] {
+  border-color: #d2a7a0;
+  background: #fff1ee;
+}
+
 .suki-svg-preview {
   display: grid;
   place-items: center;
@@ -560,6 +578,21 @@ suki-circle {
   border: 1px solid #dbe5e1;
   border-radius: 6px;
   background: #f8fbfa;
+}
+
+.suki-save-spinner {
+  inline-size: 5rem;
+  block-size: 5rem;
+  border: 0.45rem solid #9fc8bb;
+  border-block-start-color: #397b8f;
+  border-radius: 50%;
+  animation: suki-save-spinner 800ms linear infinite;
+}
+
+@keyframes suki-save-spinner {
+  to {
+    rotate: 1turn;
+  }
 }
 
 .suki-svg-preview-actions {
@@ -590,25 +623,6 @@ suki-circle {
   max-block-size: 100%;
   inline-size: auto;
   block-size: auto;
-}
-
-.suki-form input,
-.suki-form select {
-  min-width: 0;
-  border: 1px solid #bdc9c4;
-  border-radius: 0.35rem;
-  padding: 0.45rem;
-  background: #ffffff;
-}
-
-.suki-form input[type="color"] {
-  padding: 0.1rem;
-  block-size: 2.4rem;
-}
-
-.suki-form button[data-action="delete"] {
-  border-color: #d2a7a0;
-  background: #fff1ee;
 }
 
 @media (max-width: 760px) {

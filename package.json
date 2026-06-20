@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "build": "node BUILD.mjs"
+  },
+  "devDependencies": {
+    "terser": "^5.36.0",
+    "wrangler": "^4.103.0"
+  }
+}
