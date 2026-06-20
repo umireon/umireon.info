@@ -226,6 +226,7 @@ class SukiCircleEdit {
   static DEFAULT_EDGE_COLOR = "#4f5653";
   static CANVAS_PADDING = 96;
   static DRAG_START_THRESHOLD = 10;
+  static ZOOM_STEP = 0.8;
   static DOUBLE_TAP_MS = 320;
   static DOUBLE_TAP_DISTANCE = 24;
   static ADD_HINT_RADIUS = 34;
@@ -286,6 +287,10 @@ class SukiCircleEdit {
     if (event.type === "pointerdown") this.onPointerDown(event);
     if (event.type === "pointermove") this.onPointerMove(event);
     if (event.type === "pointerup" || event.type === "pointercancel") this.onPointerUp(event);
+    if (event.type === "wheel") this.onWheel(event);
+    if (event.type === "touchmove") this.onTouchMove(event);
+    if (event.type === "keydown") this.onKeyDown(event);
+    if (event.type === "gesturestart" || event.type === "gesturechange" || event.type === "gestureend") this.onGesture(event);
   }
 
   /**
@@ -350,6 +355,11 @@ class SukiCircleEdit {
       return;
     }
 
+    if (actionButton instanceof Element && actionButton.dataset.action === "share-svg-preview") {
+      void this.shareSvgPreview();
+      return;
+    }
+
     if (actionButton instanceof Element && actionButton.dataset.action === "download-html-preview") {
       this.downloadReadonlyHtml();
       return;
@@ -360,8 +370,33 @@ class SukiCircleEdit {
       return;
     }
 
+    if (actionButton instanceof Element && actionButton.dataset.action === "share-jpeg-preview") {
+      void this.shareJpegPreview();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "share-url") {
+      void this.shareUrl();
+      return;
+    }
+
     if (actionButton instanceof Element && actionButton.dataset.action === "undo") {
       this.undo();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "zoom-in") {
+      this.zoomCanvas(SukiCircleEdit.ZOOM_STEP);
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "zoom-out") {
+      this.zoomCanvas(1 / SukiCircleEdit.ZOOM_STEP);
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "reset-view") {
+      root.resetNonGraphState();
       return;
     }
 
@@ -471,10 +506,57 @@ class SukiCircleEdit {
   /**
    * @param {Event} event
    */
+  onWheel(event) {
+    const wheel = /** @type {WheelEvent} */ (event);
+    if (wheel.ctrlKey || wheel.metaKey) wheel.preventDefault();
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onGesture(event) {
+    event.preventDefault();
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onTouchMove(event) {
+    const touch = /** @type {TouchEvent} */ (event);
+    if (touch.touches.length > 1) touch.preventDefault();
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onKeyDown(event) {
+    const keyboard = /** @type {KeyboardEvent} */ (event);
+    if (!keyboard.ctrlKey && !keyboard.metaKey) return;
+    const zoomKeys = ["+", "-", "=", "0"];
+    const zoomCodes = ["Equal", "Minus", "Digit0", "NumpadAdd", "NumpadSubtract", "Numpad0"];
+    if (zoomKeys.includes(keyboard.key) || zoomCodes.includes(keyboard.code)) keyboard.preventDefault();
+  }
+
+  /**
+   * @param {Event} event
+   */
   onPointerDown(event) {
     const root = this.rootElement;
     const pointer = /** @type {PointerEvent} */ (event);
     const target = /** @type {Element} */ (event.target);
+    if (root.activePointers.has(pointer.pointerId)) return;
+    if (root.activePointers.size >= 2) {
+      pointer.preventDefault();
+      return;
+    }
+    root.activePointers.add(pointer.pointerId);
+    root.activePointerPositions.set(pointer.pointerId, { x: pointer.clientX, y: pointer.clientY });
+    if (root.activePointers.size === 2) {
+      pointer.preventDefault();
+      root.lastNodeTap = null;
+      this.startCanvasPinch(pointer);
+      return;
+    }
     if (root.editingNodeId) {
       if (target.closest(".suki-node-editor")) return;
       pointer.preventDefault();
@@ -543,11 +625,13 @@ class SukiCircleEdit {
     const originalGroup = "groupId" in entity && entity.groupId
       ? root.graph.groups.find((group) => group.id === entity.groupId) || null
       : null;
+    const startPoint = root.getCanvasPoint(pointer);
     root.selectedId = entity.id;
     root.drag = {
+      pointerId: pointer.pointerId,
       id: entity.id,
-      startX: pointer.clientX,
-      startY: pointer.clientY,
+      startX: startPoint.x,
+      startY: startPoint.y,
       previousX: pointer.clientX,
       previousY: pointer.clientY,
       previousTime: performance.now(),
@@ -586,8 +670,9 @@ class SukiCircleEdit {
     root.drag.previousY = clientY;
     root.drag.previousTime = now;
 
-    const dx = clientX - root.drag.startX;
-    const dy = clientY - root.drag.startY;
+    const point = root.getCanvasPoint({ clientX, clientY });
+    const dx = point.x - root.drag.startX;
+    const dy = point.y - root.drag.startY;
     if (!root.drag.active) {
       if (Math.hypot(dx, dy) < SukiCircleEdit.DRAG_START_THRESHOLD) return;
       root.drag.active = true;
@@ -713,12 +798,21 @@ class SukiCircleEdit {
   onPointerMove(event) {
     const root = this.rootElement;
     const pointer = /** @type {PointerEvent} */ (event);
-    if (root.pan) {
+    if (root.activePointers.has(pointer.pointerId)) {
+      root.activePointerPositions.set(pointer.pointerId, { x: pointer.clientX, y: pointer.clientY });
+    }
+    if (root.pinch) {
+      pointer.preventDefault();
+      this.applyCanvasPinch();
+      return;
+    }
+    if (root.pan?.pointerId === pointer.pointerId) {
       pointer.preventDefault();
       this.applyCanvasPan(pointer.clientX, pointer.clientY);
       return;
     }
     if (!root.drag) return;
+    if (root.drag.pointerId !== pointer.pointerId) return;
 
     pointer.preventDefault();
     this.applyDragUpdate(pointer.clientX, pointer.clientY);
@@ -730,7 +824,15 @@ class SukiCircleEdit {
   onPointerUp(event) {
     const root = this.rootElement;
     const pointer = /** @type {PointerEvent} */ (event);
-    if (root.pan) {
+    root.activePointers.delete(pointer.pointerId);
+    root.activePointerPositions.delete(pointer.pointerId);
+    if (root.pinch) {
+      pointer.preventDefault();
+      root.pinch = null;
+      root.suppressNextCanvasClick = true;
+      return;
+    }
+    if (root.pan?.pointerId === pointer.pointerId) {
       this.applyCanvasPan(pointer.clientX, pointer.clientY);
       root.suppressNextCanvasClick = root.pan.moved;
       root.pan = null;
@@ -738,6 +840,7 @@ class SukiCircleEdit {
       return;
     }
     if (!root.drag) return;
+    if (root.drag.pointerId !== pointer.pointerId) return;
 
     this.applyDragUpdate(pointer.clientX, pointer.clientY);
     if (root.drag.active) {
@@ -772,11 +875,12 @@ class SukiCircleEdit {
   startCanvasPanFrom(pointer, startX, startY) {
     const root = this.rootElement;
     const canvas = root.getCanvas();
-    root.updateCanvasViewBox();
+    if (!root.viewBox.initialized) root.updateCanvasViewBox();
     pointer.preventDefault();
     canvas.setPointerCapture(pointer.pointerId);
     canvas.classList.add("is-panning");
     root.pan = {
+      pointerId: pointer.pointerId,
       startX,
       startY,
       viewX: root.viewBox.x,
@@ -788,6 +892,109 @@ class SukiCircleEdit {
   clearAddHint() {
     const root = this.rootElement;
     root.addHint = null;
+  }
+
+  /**
+   * @param {PointerEvent} pointer
+   */
+  startCanvasPinch(pointer) {
+    const root = this.rootElement;
+    const pointerIds = [...root.activePointers].slice(0, 2);
+    const points = pointerIds.map((id) => root.activePointerPositions.get(id));
+    if (pointerIds.length < 2 || !points[0] || !points[1]) return;
+
+    if (!root.viewBox.initialized) root.updateCanvasViewBox();
+    pointer.preventDefault();
+    root.getCanvas().setPointerCapture(pointer.pointerId);
+    root.getCanvas().classList.remove("is-panning");
+    root.drag = null;
+    root.pan = null;
+    root.pinch = {
+      pointerIds: /** @type {[number, number]} */ (pointerIds),
+      previousMidpointX: (points[0].x + points[1].x) / 2,
+      previousMidpointY: (points[0].y + points[1].y) / 2,
+      previousDistance: Math.max(1, Math.hypot(points[1].x - points[0].x, points[1].y - points[0].y)),
+    };
+    root.suppressNextCanvasClick = true;
+  }
+
+  applyCanvasPinch() {
+    const root = this.rootElement;
+    if (!root.pinch) return;
+    const [firstId, secondId] = root.pinch.pointerIds;
+    const first = root.activePointerPositions.get(firstId);
+    const second = root.activePointerPositions.get(secondId);
+    if (!first || !second) return;
+
+    const distance = Math.max(1, Math.hypot(second.x - first.x, second.y - first.y));
+    const midpointX = (first.x + second.x) / 2;
+    const midpointY = (first.y + second.y) / 2;
+    const factor = Math.min(2, Math.max(0.5, root.pinch.previousDistance / distance));
+    const dx = midpointX - root.pinch.previousMidpointX;
+    const dy = midpointY - root.pinch.previousMidpointY;
+    root.pinch.previousDistance = distance;
+    root.pinch.previousMidpointX = midpointX;
+    root.pinch.previousMidpointY = midpointY;
+    this.applyCanvasZoomStep(midpointX, midpointY, factor);
+    this.applyCanvasPanStep(dx, dy);
+  }
+
+  /**
+   * @param {number} dx
+   * @param {number} dy
+   */
+  applyCanvasPanStep(dx, dy) {
+    const root = this.rootElement;
+    if (dx === 0 && dy === 0) return;
+
+    const canvas = root.getCanvas();
+    const scaleX = root.viewBox.width / Math.max(1, canvas.clientWidth);
+    const scaleY = root.viewBox.height / Math.max(1, canvas.clientHeight);
+    root.viewBox.x = root.clampViewBoxX(root.viewBox.x - dx * scaleX);
+    root.viewBox.y = root.clampViewBoxY(root.viewBox.y - dy * scaleY);
+    root.applyCanvasViewBox();
+  }
+
+  /**
+   * @param {number} factor
+   */
+  zoomCanvas(factor) {
+    const root = this.rootElement;
+    const canvas = root.getCanvas();
+    const rect = canvas.getBoundingClientRect();
+    this.applyCanvasZoomStep(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
+  }
+
+  /**
+   * @param {number} clientX
+   * @param {number} clientY
+   * @param {number} factor
+   */
+  applyCanvasZoomStep(clientX, clientY, factor) {
+    const root = this.rootElement;
+    const canvas = root.getCanvas();
+    if (!root.viewBox.initialized) root.updateCanvasViewBox();
+
+    const rect = canvas.getBoundingClientRect();
+    const viewWidth = Math.max(1, root.viewBox.width);
+    const viewHeight = Math.max(1, root.viewBox.height);
+    const focusX = root.viewBox.x + (clientX - rect.left) * viewWidth / Math.max(1, canvas.clientWidth);
+    const focusY = root.viewBox.y + (clientY - rect.top) * viewHeight / Math.max(1, canvas.clientHeight);
+    const focusRatioX = (focusX - root.viewBox.x) / viewWidth;
+    const focusRatioY = (focusY - root.viewBox.y) / viewHeight;
+    const aspect = viewWidth / viewHeight;
+    const minWidth = Math.min(CANVAS_WORLD_WIDTH, Math.max(1, canvas.clientWidth / 8));
+    const maxWidth = Math.min(CANVAS_WORLD_WIDTH, CANVAS_WORLD_HEIGHT * aspect);
+    const nextWidth = Math.min(maxWidth, Math.max(minWidth, viewWidth * factor));
+    const nextHeight = nextWidth / aspect;
+
+    if (nextWidth === viewWidth && nextHeight === viewHeight) return;
+
+    root.viewBox.width = nextWidth;
+    root.viewBox.height = nextHeight;
+    root.viewBox.x = root.clampViewBoxX(focusX - focusRatioX * nextWidth);
+    root.viewBox.y = root.clampViewBoxY(focusY - focusRatioY * nextHeight);
+    root.applyCanvasViewBox();
   }
 
   /**
@@ -1085,12 +1292,69 @@ class SukiCircleEdit {
 
   updateUrlHash(push = false) {
     const root = this.rootElement;
-    const query = createUrlQueryFromGraph(root.graph, root.documentName || "スキサークル", root.id);
+    const query = createUrlQueryFromGraph(root.graph, root.documentName || "スキサークル", root.id, root.getViewportUrlState());
     const nextUrl = `${location.pathname}${location.search}#?${query}`;
     if (push) {
       history.pushState(history.state, "", nextUrl);
     } else {
       history.replaceState(history.state, "", nextUrl);
+    }
+  }
+
+  async shareUrl() {
+    const root = this.rootElement;
+    this.updateUrlHash();
+    const url = location.href;
+    const shareData = {
+      title: root.documentName || "スキサークル",
+      url,
+    };
+    if (navigator.share && window.isSecureContext) {
+      try {
+        await navigator.share(shareData);
+        return;
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+      }
+    }
+    if (await this.copyTextToClipboard(url)) {
+      window.alert("URLをコピーしました。");
+      return;
+    }
+    window.prompt("URLをコピーしてください。", url);
+  }
+
+  /**
+   * @param {string} text
+   * @returns {Promise<boolean>}
+   */
+  async copyTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        // Fall through to the selection-based fallback.
+      }
+    }
+
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.readOnly = true;
+    textArea.style.position = "fixed";
+    textArea.style.insetBlockStart = "0";
+    textArea.style.insetInlineStart = "0";
+    textArea.style.opacity = "0";
+    document.body.append(textArea);
+    textArea.focus();
+    textArea.select();
+    textArea.setSelectionRange(0, text.length);
+    try {
+      return document.execCommand("copy");
+    } catch {
+      return false;
+    } finally {
+      textArea.remove();
     }
   }
 
@@ -1131,6 +1395,9 @@ class SukiCircleEdit {
     root.viewBox = { ...snapshot.viewBox };
     root.drag = null;
     root.pan = null;
+    root.activePointers.clear();
+    root.activePointerPositions.clear();
+    root.pinch = null;
     root.editingNodeId = null;
     root.lastCanvasTap = null;
     root.lastNodeTap = null;
@@ -1369,13 +1636,27 @@ class SukiCircleEdit {
     if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
   }
 
-  downloadSvgPreview() {
+  /**
+   * @returns {{ blob: Blob, filename: string }}
+   */
+  createSvgPreviewFileData() {
     const root = this.rootElement;
     const previewSvg = root.querySelector(".suki-svg-preview svg");
     const svg = previewSvg instanceof SVGSVGElement ? /** @type {SVGSVGElement} */ (previewSvg.cloneNode(true)) : this.toSvgDocument();
     const source = prettyPrintSvg(new XMLSerializer().serializeToString(svg));
     const blob = new Blob([source], { type: "image/svg+xml" });
-    this.downloadBlob(blob, `${fileNameStem(root.documentName)}.svg`);
+    return { blob, filename: `${fileNameStem(root.documentName)}.svg` };
+  }
+
+  downloadSvgPreview() {
+    const { blob, filename } = this.createSvgPreviewFileData();
+    this.downloadBlob(blob, filename);
+  }
+
+  async shareSvgPreview() {
+    const { blob, filename } = this.createSvgPreviewFileData();
+    if (await this.shareFile(blob, filename, "image/svg+xml")) return;
+    this.downloadBlob(blob, filename);
   }
 
   async downloadReadonlyHtml() {
@@ -1384,7 +1665,10 @@ class SukiCircleEdit {
     this.downloadBlob(blob, `${fileNameStem(root.documentName)}.html`);
   }
 
-  async downloadJpegPreview() {
+  /**
+   * @returns {Promise<{ blob: Blob, filename: string } | null>}
+   */
+  async createJpegPreviewFileData() {
     const root = this.rootElement;
     const previewSvg = root.querySelector(".suki-svg-preview svg");
     const svg = previewSvg instanceof SVGSVGElement ? /** @type {SVGSVGElement} */ (previewSvg.cloneNode(true)) : this.toSvgDocument();
@@ -1399,15 +1683,51 @@ class SukiCircleEdit {
       canvas.width = width;
       canvas.height = height;
       const context = canvas.getContext("2d");
-      if (!context) return;
+      if (!context) return null;
       context.fillStyle = "#ffffff";
       context.fillRect(0, 0, width, height);
       context.drawImage(image, 0, 0, width, height);
       const jpegBlob = await canvasToBlob(canvas, "image/jpeg", 0.9);
-      if (!jpegBlob) return;
-      this.downloadBlob(jpegBlob, `${fileNameStem(root.documentName)}.jpg`);
+      if (!jpegBlob) return null;
+      return { blob: jpegBlob, filename: `${fileNameStem(root.documentName)}.jpg` };
     } finally {
       URL.revokeObjectURL(url);
+    }
+    return null;
+  }
+
+  async downloadJpegPreview() {
+    const fileData = await this.createJpegPreviewFileData();
+    if (!fileData) return;
+    this.downloadBlob(fileData.blob, fileData.filename);
+  }
+
+  async shareJpegPreview() {
+    const fileData = await this.createJpegPreviewFileData();
+    if (!fileData) return;
+    if (await this.shareFile(fileData.blob, fileData.filename, "image/jpeg")) return;
+    this.downloadBlob(fileData.blob, fileData.filename);
+  }
+
+  /**
+   * @param {Blob} blob
+   * @param {string} filename
+   * @param {string} type
+   * @returns {Promise<boolean>}
+   */
+  async shareFile(blob, filename, type) {
+    if (!navigator.share || !window.isSecureContext) return false;
+    const file = new File([blob], filename, { type });
+    const shareData = {
+      title: this.rootElement.documentName || "スキサークル",
+      files: [file],
+    };
+    if (navigator.canShare && !navigator.canShare(shareData)) return false;
+    try {
+      await navigator.share(shareData);
+      return true;
+    } catch (error) {
+      return error instanceof DOMException && error.name === "AbortError";
     }
   }
 
