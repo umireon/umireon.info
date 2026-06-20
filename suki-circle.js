@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * @typedef {"select" | "node" | "group"} SukiTool
- *
  * @typedef {Object} SukiNode
  * @property {string} id
  * @property {string} label
@@ -34,9 +32,12 @@
  * @property {SukiNode[]} nodes
  * @property {SukiGroup[]} groups
  * @property {SukiEdge[]} edges
- * @property {string=} customCss
  *
  * @typedef {SukiNode | SukiGroup | SukiEdge} SukiEntity
+ *
+ * @typedef {Object} SukiSvgExportContext
+ * @property {HTMLElement} graphElement
+ * @property {SukiGraph} graph
  */
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -50,9 +51,11 @@ const GROUP_MIN_WIDTH = 180;
 const GROUP_MIN_HEIGHT = 150;
 const CANVAS_WORLD_WIDTH = 3200;
 const CANVAS_WORLD_HEIGHT = 2200;
+const SVG_VIEWBOX_PADDING = 36;
 const DRAG_START_THRESHOLD = 10;
 const DOUBLE_TAP_MS = 320;
 const DOUBLE_TAP_DISTANCE = 24;
+const ADD_HINT_RADIUS = 34;
 const NODE_EDIT_TAP_COUNT = 3;
 const NODE_EJECT_SPEED = 1.8;
 const NODE_EJECT_MARGIN = 24;
@@ -69,8 +72,8 @@ const NODE_LABEL_CANDIDATES = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZあいうえ�
 const MOVE_ANIMATION_MS = 180;
 const GROUP_RESIZE_ANIMATION_MS = 520;
 const EXPORTED_SVG_STYLE = `
-  .suki-edge { stroke: #4f5653; stroke-width: 5; stroke-linecap: round; }
-  .suki-edge[data-type="strong"] { stroke-width: 8; }
+  .suki-edge-line { stroke: #4f5653; stroke-width: 5; stroke-linecap: round; }
+  .suki-edge[data-type="strong"] .suki-edge-line { stroke-width: 8; }
   .suki-edge-label-background { fill: #ffffff; }
   .suki-edge-label { fill: #172026; font: 700 13px system-ui, sans-serif; }
   .suki-group-box { stroke-width: 2; fill-opacity: 0.22; }
@@ -78,6 +81,12 @@ const EXPORTED_SVG_STYLE = `
   .suki-node-circle { stroke: #9baaa4; stroke-width: 2; }
   .suki-node-label { fill: #172026; font: 700 34px system-ui, sans-serif; }
 `;
+
+/**
+ * @typedef {Object} SukiUrlInitialState
+ * @property {string} documentName
+ * @property {SukiGraph} graph
+ */
 
 /**
  * @param {string} prefix
@@ -101,15 +110,6 @@ function makeUniqueId(graph, prefix) {
     id = makeId(prefix);
   }
   return id;
-}
-
-/**
- * @param {string} id
- * @returns {string}
- */
-function cssIdSelector(id) {
-  if (globalThis.CSS?.escape) return `#${CSS.escape(id)}`;
-  return `#${id.replace(/[^a-zA-Z0-9_-]/g, "\\$&")}`;
 }
 
 /**
@@ -188,11 +188,378 @@ function setAttributes(element, attributes) {
 }
 
 /**
+ * @param {Element} element
+ * @param {string} name
+ * @param {string | number | null | undefined} value
+ */
+function setOptionalAttribute(element, name, value) {
+  if (value === null || value === undefined || value === "") {
+    element.removeAttribute(name);
+    return;
+  }
+
+  element.setAttribute(name, String(value));
+}
+
+/**
+ * @param {Element} element
+ * @param {string} name
+ * @param {number} fallback
+ * @returns {number}
+ */
+function readNumberAttribute(element, name, fallback) {
+  const value = Number(element.getAttribute(name));
+  return Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * @param {Element} element
+ * @returns {string}
+ */
+function readLabelElementText(element) {
+  return element.querySelector(":scope > suki-label")?.textContent || element.getAttribute("label") || "";
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function fileNameStem(value) {
+  const stem = value.trim().replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return stem || "suki-circle";
+}
+
+/**
  * @param {SukiGraph} graph
  * @returns {SukiGraph}
  */
 function cloneGraph(graph) {
   return structuredClone(graph);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {SukiGraph}
+ */
+function normalizeGraph(value) {
+  const graph = /** @type {SukiGraph & { customCss?: string }} */ (value);
+  delete graph.customCss;
+  return graph;
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function decodeQueryComponent(value) {
+  try {
+    return decodeURIComponent(value.replace(/\+/g, "%20"));
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * @param {string} value
+ * @returns {string[]}
+ */
+function decodeCommaFields(value) {
+  return value.split(",").map((field) => decodeQueryComponent(field));
+}
+
+/**
+ * @param {string} color
+ * @param {string} fallback
+ * @returns {string}
+ */
+function normalizeUrlColor(color, fallback) {
+  const value = color.trim();
+  if (/^#[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(value)) return value;
+  if (/^[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(value)) return `#${value}`;
+  return fallback;
+}
+
+/**
+ * @param {string} prefix
+ * @param {number} reference
+ * @returns {string}
+ */
+function idFromUrlReference(prefix, reference) {
+  return `${prefix}-${Math.max(0, reference).toString(16).padStart(7, "0").slice(-7)}`;
+}
+
+/**
+ * @param {string} search
+ * @returns {{ key: string, value: string }[]}
+ */
+function parseRawQueryEntries(search) {
+  const source = search.startsWith("?") ? search.slice(1) : search;
+  if (!source) return [];
+  return source.split("&").filter(Boolean).map((entry) => {
+    const separatorIndex = entry.indexOf("=");
+    const rawKey = separatorIndex >= 0 ? entry.slice(0, separatorIndex) : entry;
+    const rawValue = separatorIndex >= 0 ? entry.slice(separatorIndex + 1) : "";
+    return {
+      key: decodeQueryComponent(rawKey),
+      value: rawValue,
+    };
+  });
+}
+
+/**
+ * @param {string} hash
+ * @returns {string}
+ */
+function queryFromHash(hash) {
+  if (hash.startsWith("#?")) return hash.slice(1);
+  if (hash.startsWith("#")) return `?${hash.slice(1)}`;
+  return "";
+}
+
+/**
+ * @param {string} search
+ * @returns {SukiUrlInitialState | null}
+ */
+function readInitialStateFromUrlSearch(search) {
+  const entries = parseRawQueryEntries(search);
+  if (!entries.some((entry) => entry.key === "suki-circle" && decodeQueryComponent(entry.value) === "v1")) return null;
+
+  /** @type {Map<number, SukiGroup>} */
+  const groupsByReference = new Map();
+  /** @type {Map<number, SukiNode>} */
+  const nodesByReference = new Map();
+  /** @type {Map<number, string>} */
+  const labelsByReference = new Map();
+  /** @type {Map<number, string>} */
+  const colorsByReference = new Map();
+  /** @type {{ reference: number, sourceReference: number, targetReference: number, label: string, color: string }[]} */
+  const edgeEntries = [];
+  let documentName = "スキサークル";
+
+  entries.forEach(({ key, value }) => {
+    if (key === "t") {
+      documentName = decodeQueryComponent(value).trim() || documentName;
+      return;
+    }
+
+    const match = key.match(/^(g|n|e|l|c)\[(\d+)\]$/);
+    if (!match) return;
+
+    const reference = Number(match[2]);
+    if (!Number.isInteger(reference) || reference < 0) return;
+
+    if (match[1] === "l") {
+      labelsByReference.set(reference, decodeQueryComponent(value));
+      return;
+    }
+
+    if (match[1] === "c") {
+      colorsByReference.set(reference, decodeQueryComponent(value));
+      return;
+    }
+
+    const fields = decodeCommaFields(value);
+    if (match[1] === "g") {
+      groupsByReference.set(reference, {
+        id: idFromUrlReference("group", reference),
+        label: fields.length >= 2 ? fields[0] || "" : "",
+        x: 0,
+        y: 0,
+        width: GROUP_MIN_WIDTH,
+        height: GROUP_MIN_HEIGHT,
+        color: normalizeUrlColor(fields.length >= 2 ? fields[1] || "" : fields[0] || "", GROUP_PALETTE[0]),
+      });
+      return;
+    }
+
+    if (match[1] === "n") {
+      const x = Number(fields[0]);
+      const y = Number(fields[1]);
+      const groupReferenceField = fields.length >= 5 ? fields[4] : fields.length >= 4 ? fields[3] : fields[2];
+      const groupReference = groupReferenceField === "" || groupReferenceField === undefined ? NaN : Number(groupReferenceField);
+      nodesByReference.set(reference, {
+        id: idFromUrlReference("node", reference),
+        label: fields.length >= 5 ? fields[3] || "" : "",
+        x: Number.isFinite(x) ? x : CANVAS_WORLD_WIDTH / 2,
+        y: Number.isFinite(y) ? y : CANVAS_WORLD_HEIGHT / 2,
+        groupId: Number.isFinite(groupReference) ? idFromUrlReference("group", groupReference) : null,
+        color: normalizeUrlColor(fields.length >= 4 ? fields[2] || "" : "", NODE_PALETTE[0]),
+      });
+      return;
+    }
+
+    const sourceReference = Number(fields[0]);
+    const targetReference = Number(fields[1]);
+    if (!Number.isFinite(sourceReference) || !Number.isFinite(targetReference)) return;
+    edgeEntries.push({
+      reference,
+      sourceReference,
+      targetReference,
+      label: fields.length >= 4 ? fields[2] || "" : "",
+      color: normalizeUrlColor(fields.length >= 4 ? fields[3] || "" : fields[2] || "", DEFAULT_EDGE_COLOR),
+    });
+  });
+
+  labelsByReference.forEach((label, reference) => {
+    const group = groupsByReference.get(reference);
+    if (group) group.label = label;
+    const node = nodesByReference.get(reference);
+    if (node) node.label = label;
+    const edge = edgeEntries.find((item) => item.reference === reference);
+    if (edge) edge.label = label;
+  });
+
+  colorsByReference.forEach((color, reference) => {
+    const group = groupsByReference.get(reference);
+    if (group) group.color = normalizeUrlColor(color, group.color);
+    const node = nodesByReference.get(reference);
+    if (node) node.color = normalizeUrlColor(color, node.color);
+    const edge = edgeEntries.find((item) => item.reference === reference);
+    if (edge) edge.color = normalizeUrlColor(color, edge.color);
+  });
+
+  const graph = normalizeGraph({
+    groups: [...groupsByReference.entries()].sort(([left], [right]) => left - right).map(([, group]) => group),
+    nodes: [...nodesByReference.entries()].sort(([left], [right]) => left - right).map(([, node]) => {
+      if (node.groupId && !groupsByReference.has(Number.parseInt(node.groupId.slice("group-".length), 16))) {
+        node.groupId = null;
+      }
+      return node;
+    }),
+    edges: edgeEntries
+      .filter((edge) => nodesByReference.has(edge.sourceReference) && nodesByReference.has(edge.targetReference))
+      .sort((left, right) => left.reference - right.reference)
+      .map((edge) => ({
+        id: idFromUrlReference("edge", edge.reference),
+        sourceId: idFromUrlReference("node", edge.sourceReference),
+        targetId: idFromUrlReference("node", edge.targetReference),
+        label: edge.label,
+        type: "related",
+        color: edge.color,
+      })),
+  });
+
+  updateGroupGeometry(graph);
+  return { documentName, graph };
+}
+
+/**
+ * @returns {SukiUrlInitialState | null}
+ */
+function readInitialStateFromLocation() {
+  return readInitialStateFromUrlSearch(queryFromHash(location.hash))
+    || readInitialStateFromUrlSearch(location.search);
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function encodeUrlValue(value) {
+  return encodeURIComponent(value).replace(/%20/g, "+");
+}
+
+/**
+ * @param {string} name
+ * @param {number} reference
+ * @returns {string}
+ */
+function urlReferenceKey(name, reference) {
+  return `${name}[${reference}]`;
+}
+
+/**
+ * @param {string} id
+ * @param {Map<string, number>} references
+ * @returns {number}
+ */
+function referenceForId(id, references) {
+  const value = references.get(id);
+  if (value === undefined) throw new Error(`Missing URL reference for ${id}.`);
+  return value;
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @returns {Map<string, number>}
+ */
+function createUrlReferences(graph) {
+  /** @type {Map<string, number>} */
+  const references = new Map();
+  let nextReference = 1;
+  graph.groups.forEach((group) => {
+    references.set(group.id, nextReference);
+    nextReference += 1;
+  });
+  graph.nodes.forEach((node) => {
+    references.set(node.id, nextReference);
+    nextReference += 1;
+  });
+  graph.edges.forEach((edge) => {
+    references.set(edge.id, nextReference);
+    nextReference += 1;
+  });
+  return references;
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @param {string} documentName
+ * @returns {string}
+ */
+function createUrlQueryFromGraph(graph, documentName) {
+  const sourceGraph = cloneGraph(graph);
+  updateGroupGeometry(sourceGraph);
+  const references = createUrlReferences(sourceGraph);
+  /** @type {string[]} */
+  const entries = [`suki-circle=${encodeUrlValue("v1")}`];
+  const title = documentName.trim();
+  if (title) entries.push(`t=${encodeUrlValue(title)}`);
+
+  sourceGraph.groups.forEach((group) => {
+    const reference = referenceForId(group.id, references);
+    entries.push(`${urlReferenceKey("g", reference)}=`);
+    if (group.color) entries.push(`${urlReferenceKey("c", reference)}=${encodeUrlValue(group.color.replace(/^#/, ""))}`);
+    if (group.label) entries.push(`${urlReferenceKey("l", reference)}=${encodeUrlValue(group.label)}`);
+  });
+
+  sourceGraph.nodes.forEach((node) => {
+    const reference = referenceForId(node.id, references);
+    const fields = [
+      String(Math.round(node.x)),
+      String(Math.round(node.y)),
+    ];
+    if (node.groupId && references.has(node.groupId)) fields.push(String(referenceForId(node.groupId, references)));
+    entries.push(`${urlReferenceKey("n", reference)}=${fields.map(encodeUrlValue).join(",")}`);
+    if (node.color) entries.push(`${urlReferenceKey("c", reference)}=${encodeUrlValue(node.color.replace(/^#/, ""))}`);
+    if (node.label) entries.push(`${urlReferenceKey("l", reference)}=${encodeUrlValue(node.label)}`);
+  });
+
+  sourceGraph.edges.forEach((edge) => {
+    if (!references.has(edge.sourceId) || !references.has(edge.targetId)) return;
+    const reference = referenceForId(edge.id, references);
+    entries.push(`${urlReferenceKey("e", reference)}=${[
+      String(referenceForId(edge.sourceId, references)),
+      String(referenceForId(edge.targetId, references)),
+    ].map(encodeUrlValue).join(",")}`);
+    const edgeColor = getEdgeColor(edge);
+    if (edgeColor !== DEFAULT_EDGE_COLOR) entries.push(`${urlReferenceKey("c", reference)}=${encodeUrlValue(edgeColor.replace(/^#/, ""))}`);
+    if (edge.label) entries.push(`${urlReferenceKey("l", reference)}=${encodeUrlValue(edge.label)}`);
+  });
+
+  return entries.join("&");
 }
 
 /**
@@ -252,6 +619,93 @@ function getGroupBox(group) {
     top: group.y - height / 2,
     width,
     height,
+  };
+}
+
+/**
+ * @param {{ left: number, top: number, right: number, bottom: number } | null} bounds
+ * @param {{ left: number, top: number, right: number, bottom: number }} box
+ * @returns {{ left: number, top: number, right: number, bottom: number }}
+ */
+function includeBounds(bounds, box) {
+  if (!bounds) return { ...box };
+  return {
+    left: Math.min(bounds.left, box.left),
+    top: Math.min(bounds.top, box.top),
+    right: Math.max(bounds.right, box.right),
+    bottom: Math.max(bounds.bottom, box.bottom),
+  };
+}
+
+/**
+ * @param {number} value
+ * @returns {string}
+ */
+function formatSvgNumber(value) {
+  return Number(value.toFixed(2)).toString();
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @returns {{ x: number, y: number, width: number, height: number }}
+ */
+function getGraphContentViewBox(graph) {
+  /** @type {{ left: number, top: number, right: number, bottom: number } | null} */
+  let bounds = null;
+
+  graph.groups.forEach((group) => {
+    const box = getGroupBox(group);
+    bounds = includeBounds(bounds, {
+      left: box.left,
+      top: box.top,
+      right: box.left + box.width,
+      bottom: box.top + box.height,
+    });
+  });
+
+  graph.nodes.forEach((node) => {
+    bounds = includeBounds(bounds, {
+      left: node.x - NODE_RADIUS,
+      top: node.y - NODE_RADIUS,
+      right: node.x + NODE_RADIUS,
+      bottom: node.y + NODE_RADIUS,
+    });
+  });
+
+  graph.edges.forEach((edge) => {
+    const source = graph.nodes.find((node) => node.id === edge.sourceId);
+    const target = graph.nodes.find((node) => node.id === edge.targetId);
+    if (!source || !target) return;
+    const strokePadding = edge.type === "strong" ? 8 : 5;
+    bounds = includeBounds(bounds, {
+      left: Math.min(source.x, target.x) - strokePadding,
+      top: Math.min(source.y, target.y) - strokePadding,
+      right: Math.max(source.x, target.x) + strokePadding,
+      bottom: Math.max(source.y, target.y) + strokePadding,
+    });
+
+    if (!edge.label) return;
+    const labelX = (source.x + target.x) / 2;
+    const labelY = (source.y + target.y) / 2 + 14;
+    const labelWidth = Math.max(34, edge.label.length * 14 + 18);
+    const labelHeight = 24;
+    bounds = includeBounds(bounds, {
+      left: labelX - labelWidth / 2,
+      top: labelY - labelHeight / 2,
+      right: labelX + labelWidth / 2,
+      bottom: labelY + labelHeight / 2,
+    });
+  });
+
+  if (!bounds) return { x: 0, y: 0, width: CANVAS_WORLD_WIDTH, height: CANVAS_WORLD_HEIGHT };
+
+  const x = bounds.left - SVG_VIEWBOX_PADDING;
+  const y = bounds.top - SVG_VIEWBOX_PADDING;
+  return {
+    x,
+    y,
+    width: Math.max(1, bounds.right - bounds.left + SVG_VIEWBOX_PADDING * 2),
+    height: Math.max(1, bounds.bottom - bounds.top + SVG_VIEWBOX_PADDING * 2),
   };
 }
 
@@ -949,7 +1403,684 @@ function renderSvgEdgeLabel(element, graph, edge) {
   label.toggleAttribute("hidden", !edge.label);
 }
 
-class SukiCircleElement extends HTMLElement {
+/**
+ * @param {SVGElement} element
+ * @param {{ x: number, y: number }} hint
+ */
+function renderSvgAddHint(element, hint) {
+  element.setAttribute("class", "suki-add-hint");
+  element.setAttribute("transform", `translate(${hint.x} ${hint.y})`);
+  element.dataset.action = "add-node-at";
+  element.dataset.x = String(hint.x);
+  element.dataset.y = String(hint.y);
+
+  const filterId = "suki-add-hint-blur";
+  const defs = svgElement("defs");
+
+  const filter = svgElement("filter");
+  setAttributes(filter, { id: filterId, x: "-35%", y: "-35%", width: "170%", height: "170%" });
+  const blur = svgElement("feGaussianBlur");
+  setAttributes(blur, { stdDeviation: 1.8 });
+  filter.append(blur);
+
+  defs.append(filter);
+
+  const disc = svgElement("circle");
+  disc.classList.add("suki-add-hint-disc");
+  setAttributes(disc, {
+    cx: 0,
+    cy: 0,
+    r: ADD_HINT_RADIUS,
+    filter: `url(#${filterId})`,
+  });
+
+  const plus = svgElement("g");
+  plus.classList.add("suki-add-hint-plus");
+  const vertical = svgElement("rect");
+  setAttributes(vertical, { x: -4, y: -17, width: 8, height: 34, rx: 3 });
+  const horizontal = svgElement("rect");
+  setAttributes(horizontal, { x: -17, y: -4, width: 34, height: 8, rx: 3 });
+  plus.append(vertical, horizontal);
+
+  element.replaceChildren(defs, disc, plus);
+}
+
+/**
+ * @param {string} name
+ * @returns {any}
+ */
+function sukiElementConstructor(name) {
+  const constructor = customElements.get(name);
+  if (!constructor) throw new Error(`${name} is not defined.`);
+  return constructor;
+}
+
+if (!customElements.get("suki-label")) customElements.define("suki-label", class extends HTMLElement {
+  /**
+   * @param {string} label
+   * @returns {HTMLElement}
+   */
+  static fromLabel(label) {
+    const element = document.createElement("suki-label");
+    element.textContent = label;
+    return element;
+  }
+});
+
+if (!customElements.get("suki-node")) customElements.define("suki-node", class extends HTMLElement {
+  /**
+   * @param {SukiNode} node
+   * @returns {HTMLElement}
+   */
+  static fromNode(node) {
+    const element = document.createElement("suki-node");
+    element.setAttribute("id", node.id);
+    element.setAttribute("x", String(node.x));
+    element.setAttribute("y", String(node.y));
+    element.setAttribute("color", node.color);
+    setOptionalAttribute(element, "group", node.groupId);
+    element.append(sukiElementConstructor("suki-label").fromLabel(node.label));
+    return element;
+  }
+
+  /**
+   * @returns {SukiNode}
+   */
+  toGraphNode() {
+    return {
+      id: this.getAttribute("id") || makeId("node"),
+      label: readLabelElementText(this),
+      x: readNumberAttribute(this, "x", CANVAS_WORLD_WIDTH / 2),
+      y: readNumberAttribute(this, "y", CANVAS_WORLD_HEIGHT / 2),
+      groupId: this.getAttribute("group") || null,
+      color: this.getAttribute("color") || NODE_PALETTE[0],
+    };
+  }
+
+  /**
+   * @param {SukiSvgExportContext} context
+   * @returns {SVGElement}
+   */
+  toSvg(context) {
+    const node = context.graph.nodes.find((item) => item.id === this.getAttribute("id")) || this.toGraphNode();
+    const element = svgElement("g");
+    renderSvgNode(element, node, false, false, 0);
+    return element;
+  }
+});
+
+if (!customElements.get("suki-group")) customElements.define("suki-group", class extends HTMLElement {
+  /**
+   * @param {SukiGroup} group
+   * @param {number} memberCount
+   * @returns {HTMLElement}
+   */
+  static fromGroup(group, memberCount) {
+    const element = document.createElement("suki-group");
+    element.setAttribute("id", group.id);
+    element.setAttribute("color", group.color);
+    element.append(sukiElementConstructor("suki-label").fromLabel(group.label));
+    if (memberCount === 0) {
+      element.setAttribute("x", String(group.x));
+      element.setAttribute("y", String(group.y));
+      element.setAttribute("width", String(group.width));
+      element.setAttribute("height", String(group.height));
+    }
+    return element;
+  }
+
+  /**
+   * @returns {SukiGroup}
+   */
+  toGraphGroup() {
+    return {
+      id: this.getAttribute("id") || makeId("group"),
+      label: readLabelElementText(this),
+      x: readNumberAttribute(this, "x", 0),
+      y: readNumberAttribute(this, "y", 0),
+      width: readNumberAttribute(this, "width", GROUP_MIN_WIDTH),
+      height: readNumberAttribute(this, "height", GROUP_MIN_HEIGHT),
+      color: this.getAttribute("color") || GROUP_PALETTE[0],
+    };
+  }
+
+  /**
+   * @param {SukiSvgExportContext} context
+   * @returns {SVGElement}
+   */
+  toSvg(context) {
+    const group = context.graph.groups.find((item) => item.id === this.getAttribute("id")) || this.toGraphGroup();
+    const element = svgElement("g");
+    renderSvgGroup(element, group, false, false, 0, 0);
+    return element;
+  }
+});
+
+if (!customElements.get("suki-edge")) customElements.define("suki-edge", class extends HTMLElement {
+  /**
+   * @param {SukiEdge} edge
+   * @returns {HTMLElement}
+   */
+  static fromEdge(edge) {
+    const element = document.createElement("suki-edge");
+    element.setAttribute("id", edge.id);
+    element.setAttribute("source", edge.sourceId);
+    element.setAttribute("target", edge.targetId);
+    if (edge.type !== "related") element.setAttribute("type", edge.type);
+    if (edge.color !== DEFAULT_EDGE_COLOR) element.setAttribute("color", edge.color);
+    if (edge.label) element.append(sukiElementConstructor("suki-label").fromLabel(edge.label));
+    return element;
+  }
+
+  /**
+   * @returns {SukiEdge}
+   */
+  toGraphEdge() {
+    return {
+      id: this.getAttribute("id") || makeId("edge"),
+      sourceId: this.getAttribute("source") || "",
+      targetId: this.getAttribute("target") || "",
+      label: readLabelElementText(this),
+      type: /** @type {SukiEdge["type"]} */ (this.getAttribute("type") || "related"),
+      color: this.getAttribute("color") || DEFAULT_EDGE_COLOR,
+    };
+  }
+
+  /**
+   * @param {SukiSvgExportContext} context
+   * @returns {SVGElement}
+   */
+  toSvg(context) {
+    const edge = context.graph.edges.find((item) => item.id === this.getAttribute("id")) || this.toGraphEdge();
+    const element = svgElement("g");
+    renderSvgEdge(element, context.graph, edge, false);
+    return element;
+  }
+
+  /**
+   * @param {SukiSvgExportContext} context
+   * @returns {SVGElement | null}
+   */
+  toSvgLabel(context) {
+    const edge = context.graph.edges.find((item) => item.id === this.getAttribute("id")) || this.toGraphEdge();
+    if (!edge.label) return null;
+    const element = svgElement("g");
+    renderSvgEdgeLabel(element, context.graph, edge);
+    return element;
+  }
+});
+
+if (!customElements.get("suki-graph")) customElements.define("suki-graph", class extends HTMLElement {
+  /**
+   * @param {SukiGraph} sourceGraph
+   * @returns {HTMLElement}
+   */
+  static fromGraph(sourceGraph) {
+    const graph = cloneGraph(sourceGraph);
+    updateGroupGeometry(graph);
+
+    const element = document.createElement("suki-graph");
+    graph.groups.forEach((group) => {
+      const groupElement = sukiElementConstructor("suki-group").fromGroup(group, getGroupMembers(graph, group.id).length);
+      getGroupMembers(graph, group.id).forEach((node) => {
+        const nodeElement = sukiElementConstructor("suki-node").fromNode(node);
+        nodeElement.removeAttribute("group");
+        groupElement.append(nodeElement);
+      });
+      element.append(groupElement);
+    });
+    graph.edges.forEach((edge) => {
+      element.append(sukiElementConstructor("suki-edge").fromEdge(edge));
+    });
+    graph.nodes.filter((node) => !node.groupId).forEach((node) => {
+      element.append(sukiElementConstructor("suki-node").fromNode(node));
+    });
+    return element;
+  }
+
+  /**
+   * @returns {SukiGraph}
+   */
+  toGraph() {
+    const groupedNodes = [...this.querySelectorAll(":scope > suki-group")].flatMap((groupElement) => {
+      const groupId = groupElement.getAttribute("id") || "";
+      return [...groupElement.querySelectorAll(":scope > suki-node")].map((nodeElement) => {
+        const node = /** @type {any} */ (nodeElement).toGraphNode();
+        node.groupId = groupId || node.groupId;
+        return node;
+      });
+    });
+    const graph = {
+      groups: [...this.querySelectorAll(":scope > suki-group")].map((element) => {
+        return /** @type {any} */ (element).toGraphGroup();
+      }),
+      edges: [...this.querySelectorAll(":scope > suki-edge")].map((element) => {
+        return /** @type {any} */ (element).toGraphEdge();
+      }),
+      nodes: groupedNodes.concat([...this.querySelectorAll(":scope > suki-node")].map((element) => {
+        return /** @type {any} */ (element).toGraphNode();
+      })),
+    };
+    updateGroupGeometry(graph);
+    return normalizeGraph(graph);
+  }
+
+  /**
+   * @returns {string}
+   */
+  toMarkup() {
+    return this.outerHTML;
+  }
+
+  /**
+   * @returns {SVGSVGElement}
+   */
+  toSvgDocument() {
+    const graph = this.toGraph();
+    const context = { graphElement: this, graph };
+    const viewBox = getGraphContentViewBox(graph);
+    const svg = /** @type {SVGSVGElement} */ (svgElement("svg"));
+    setAttributes(svg, {
+      xmlns: SVG_NS,
+      width: formatSvgNumber(viewBox.width),
+      height: formatSvgNumber(viewBox.height),
+      viewBox: `${formatSvgNumber(viewBox.x)} ${formatSvgNumber(viewBox.y)} ${formatSvgNumber(viewBox.width)} ${formatSvgNumber(viewBox.height)}`,
+    });
+
+    const style = svgElement("style");
+    style.textContent = EXPORTED_SVG_STYLE;
+
+    const viewport = svgElement("g");
+    viewport.classList.add("suki-viewport");
+    const groupsLayer = svgElement("g");
+    groupsLayer.classList.add("suki-groups");
+    const edgesLayer = svgElement("g");
+    edgesLayer.classList.add("suki-edges");
+    const nodesLayer = svgElement("g");
+    nodesLayer.classList.add("suki-nodes");
+    const edgeLabelsLayer = svgElement("g");
+    edgeLabelsLayer.classList.add("suki-edge-labels");
+
+    [...this.querySelectorAll(":scope > suki-group")].forEach((element) => {
+      groupsLayer.append(/** @type {any} */ (element).toSvg(context));
+    });
+    [...this.querySelectorAll(":scope > suki-edge")].forEach((element) => {
+      edgesLayer.append(/** @type {any} */ (element).toSvg(context));
+    });
+    [...this.querySelectorAll("suki-node")].forEach((element) => {
+      nodesLayer.append(/** @type {any} */ (element).toSvg(context));
+    });
+    [...this.querySelectorAll(":scope > suki-edge")].forEach((element) => {
+      const label = /** @type {any} */ (element).toSvgLabel(context);
+      if (label) edgeLabelsLayer.append(label);
+    });
+
+    viewport.append(groupsLayer, edgesLayer, nodesLayer, edgeLabelsLayer);
+    svg.append(style, viewport);
+    svg.querySelectorAll("[data-entity-kind], [data-id], [data-x], [data-y], [data-width], [data-height]").forEach((element) => {
+      ["data-entity-kind", "data-id", "data-x", "data-y", "data-width", "data-height"].forEach((name) => {
+        element.removeAttribute(name);
+      });
+    });
+    return svg;
+  }
+});
+
+/**
+ * @param {SukiGraph} sourceGraph
+ * @returns {SVGSVGElement}
+ */
+function createExportSvg(sourceGraph) {
+  return sukiElementConstructor("suki-graph").fromGraph(sourceGraph).toSvgDocument();
+}
+
+/**
+ * @param {string} source
+ * @returns {string}
+ */
+function prettyPrintSvg(source) {
+  const tokens = source.replace(/></g, ">\n<").split("\n");
+  let indent = 0;
+  const lines = tokens.map((token) => token.trim()).filter(Boolean).map((token) => {
+    const isClosing = token.startsWith("</");
+    const isDeclaration = token.startsWith("<?");
+    const isSelfClosing = token.endsWith("/>");
+    const isTextOnly = !token.startsWith("<");
+    if (isClosing) indent = Math.max(0, indent - 1);
+    const line = `${"  ".repeat(indent)}${token}`;
+    if (!isClosing && !isDeclaration && !isSelfClosing && !isTextOnly && !token.includes("</")) {
+      indent += 1;
+    }
+    return line;
+  });
+  return `${lines.join("\n")}\n`;
+}
+
+const READONLY_HTML_SCRIPT = `
+(() => {
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const NODE_RADIUS = 44;
+  const GROUP_MIN_WIDTH = 180;
+  const GROUP_MIN_HEIGHT = 150;
+  const GROUP_PADDING_X = 28;
+  const GROUP_PADDING_TOP = 42;
+  const GROUP_PADDING_BOTTOM = 24;
+  const SVG_VIEWBOX_PADDING = 36;
+  const DEFAULT_EDGE_COLOR = "#4f5653";
+
+  function svgElement(name) {
+    return document.createElementNS(SVG_NS, name);
+  }
+
+  function setAttributes(element, attributes) {
+    Object.entries(attributes).forEach(([name, value]) => element.setAttribute(name, String(value)));
+  }
+
+  function readNumber(element, name, fallback) {
+    const value = Number(element.getAttribute(name));
+    return Number.isFinite(value) ? value : fallback;
+  }
+
+  function readLabel(element) {
+    return element.querySelector(":scope > suki-label")?.textContent || element.getAttribute("label") || "";
+  }
+
+  function labelLines(text) {
+    const lines = text.split(/\\r?\\n/);
+    return lines.length ? lines : [""];
+  }
+
+  function groupMembers(graph, id) {
+    return graph.nodes.filter((node) => node.groupId === id);
+  }
+
+  function groupGeometry(members) {
+    if (!members.length) return { x: 0, y: 0, width: GROUP_MIN_WIDTH, height: GROUP_MIN_HEIGHT };
+    const minX = Math.min(...members.map((node) => node.x - NODE_RADIUS));
+    const maxX = Math.max(...members.map((node) => node.x + NODE_RADIUS));
+    const minY = Math.min(...members.map((node) => node.y - NODE_RADIUS));
+    const maxY = Math.max(...members.map((node) => node.y + NODE_RADIUS));
+    const left = minX - GROUP_PADDING_X;
+    const top = minY - GROUP_PADDING_TOP;
+    const width = Math.max(GROUP_MIN_WIDTH, maxX - minX + GROUP_PADDING_X * 2);
+    const height = Math.max(GROUP_MIN_HEIGHT, maxY - minY + GROUP_PADDING_TOP + GROUP_PADDING_BOTTOM);
+    return { x: left + width / 2, y: top + height / 2, width, height };
+  }
+
+  function updateGroups(graph) {
+    graph.groups.forEach((group) => {
+      const members = groupMembers(graph, group.id);
+      if (members.length) Object.assign(group, groupGeometry(members));
+    });
+  }
+
+  function groupBox(group) {
+    const width = group.width || GROUP_MIN_WIDTH;
+    const height = group.height || GROUP_MIN_HEIGHT;
+    return { left: group.x - width / 2, top: group.y - height / 2, width, height };
+  }
+
+  function includeBounds(bounds, box) {
+    if (!bounds) return { ...box };
+    return {
+      left: Math.min(bounds.left, box.left),
+      top: Math.min(bounds.top, box.top),
+      right: Math.max(bounds.right, box.right),
+      bottom: Math.max(bounds.bottom, box.bottom),
+    };
+  }
+
+  function graphViewBox(graph) {
+    let bounds = null;
+    graph.groups.forEach((group) => {
+      const box = groupBox(group);
+      bounds = includeBounds(bounds, { left: box.left, top: box.top, right: box.left + box.width, bottom: box.top + box.height });
+    });
+    graph.nodes.forEach((node) => {
+      bounds = includeBounds(bounds, { left: node.x - NODE_RADIUS, top: node.y - NODE_RADIUS, right: node.x + NODE_RADIUS, bottom: node.y + NODE_RADIUS });
+    });
+    graph.edges.forEach((edge) => {
+      const source = graph.nodes.find((node) => node.id === edge.sourceId);
+      const target = graph.nodes.find((node) => node.id === edge.targetId);
+      if (!source || !target) return;
+      const strokePadding = edge.type === "strong" ? 8 : 5;
+      bounds = includeBounds(bounds, {
+        left: Math.min(source.x, target.x) - strokePadding,
+        top: Math.min(source.y, target.y) - strokePadding,
+        right: Math.max(source.x, target.x) + strokePadding,
+        bottom: Math.max(source.y, target.y) + strokePadding,
+      });
+      if (!edge.label) return;
+      const labelX = (source.x + target.x) / 2;
+      const labelY = (source.y + target.y) / 2 + 14;
+      const labelWidth = Math.max(34, edge.label.length * 14 + 18);
+      const labelHeight = 24;
+      bounds = includeBounds(bounds, {
+        left: labelX - labelWidth / 2,
+        top: labelY - labelHeight / 2,
+        right: labelX + labelWidth / 2,
+        bottom: labelY + labelHeight / 2,
+      });
+    });
+    if (!bounds) return { x: 0, y: 0, width: 1, height: 1 };
+    return {
+      x: bounds.left - SVG_VIEWBOX_PADDING,
+      y: bounds.top - SVG_VIEWBOX_PADDING,
+      width: Math.max(1, bounds.right - bounds.left + SVG_VIEWBOX_PADDING * 2),
+      height: Math.max(1, bounds.bottom - bounds.top + SVG_VIEWBOX_PADDING * 2),
+    };
+  }
+
+  function graphFromElement(root) {
+    const graphElement = root.querySelector(":scope > suki-graph");
+    if (!graphElement) return { groups: [], nodes: [], edges: [] };
+    const groupedNodes = [...graphElement.querySelectorAll(":scope > suki-group")].flatMap((groupElement) => {
+      const groupId = groupElement.getAttribute("id") || "";
+      return [...groupElement.querySelectorAll(":scope > suki-node")].map((nodeElement) => ({
+        id: nodeElement.getAttribute("id") || "",
+        label: readLabel(nodeElement),
+        x: readNumber(nodeElement, "x", 0),
+        y: readNumber(nodeElement, "y", 0),
+        color: nodeElement.getAttribute("color") || "#ffffff",
+        groupId,
+      }));
+    });
+    const looseNodes = [...graphElement.querySelectorAll(":scope > suki-node")].map((nodeElement) => ({
+      id: nodeElement.getAttribute("id") || "",
+      label: readLabel(nodeElement),
+      x: readNumber(nodeElement, "x", 0),
+      y: readNumber(nodeElement, "y", 0),
+      color: nodeElement.getAttribute("color") || "#ffffff",
+      groupId: null,
+    }));
+    const graph = {
+      groups: [...graphElement.querySelectorAll(":scope > suki-group")].map((groupElement) => ({
+        id: groupElement.getAttribute("id") || "",
+        label: readLabel(groupElement),
+        x: readNumber(groupElement, "x", 0),
+        y: readNumber(groupElement, "y", 0),
+        width: readNumber(groupElement, "width", GROUP_MIN_WIDTH),
+        height: readNumber(groupElement, "height", GROUP_MIN_HEIGHT),
+        color: groupElement.getAttribute("color") || "#5fb2cb",
+      })),
+      nodes: groupedNodes.concat(looseNodes),
+      edges: [...graphElement.querySelectorAll(":scope > suki-edge")].map((edgeElement) => ({
+        id: edgeElement.getAttribute("id") || "",
+        sourceId: edgeElement.getAttribute("source") || "",
+        targetId: edgeElement.getAttribute("target") || "",
+        label: readLabel(edgeElement),
+        type: edgeElement.getAttribute("type") || "related",
+        color: edgeElement.getAttribute("color") || DEFAULT_EDGE_COLOR,
+      })),
+    };
+    updateGroups(graph);
+    return graph;
+  }
+
+  function renderGraph(graph) {
+    const viewBox = graphViewBox(graph);
+    const svg = svgElement("svg");
+    setAttributes(svg, {
+      xmlns: SVG_NS,
+      width: Number(viewBox.width.toFixed(2)),
+      height: Number(viewBox.height.toFixed(2)),
+      viewBox: [viewBox.x, viewBox.y, viewBox.width, viewBox.height].map((value) => Number(value.toFixed(2))).join(" "),
+    });
+
+    const groupsLayer = svgElement("g");
+    const edgesLayer = svgElement("g");
+    const nodesLayer = svgElement("g");
+    const labelsLayer = svgElement("g");
+
+    graph.groups.forEach((group) => {
+      const box = groupBox(group);
+      const g = svgElement("g");
+      g.id = group.id;
+      const rect = svgElement("rect");
+      setAttributes(rect, { x: box.left, y: box.top, width: box.width, height: box.height, rx: 8, fill: group.color, stroke: group.color, "stroke-width": 2, "fill-opacity": 0.22 });
+      const text = svgElement("text");
+      setAttributes(text, { x: box.left + 14, y: box.top + 28, fill: "#24342f", "font-family": "system-ui, sans-serif", "font-size": 15, "font-weight": 700 });
+      labelLines(group.label).forEach((line, index) => {
+        const tspan = svgElement("tspan");
+        setAttributes(tspan, { x: box.left + 14, dy: index === 0 ? 0 : "1.25em" });
+        tspan.textContent = line || " ";
+        text.append(tspan);
+      });
+      g.append(rect, text);
+      groupsLayer.append(g);
+    });
+
+    graph.edges.forEach((edge) => {
+      const source = graph.nodes.find((node) => node.id === edge.sourceId);
+      const target = graph.nodes.find((node) => node.id === edge.targetId);
+      if (!source || !target) return;
+      const g = svgElement("g");
+      g.id = edge.id;
+      const line = svgElement("line");
+      setAttributes(line, { x1: source.x, y1: source.y, x2: target.x, y2: target.y, stroke: edge.color, "stroke-width": edge.type === "strong" ? 8 : 5, "stroke-linecap": "round" });
+      g.append(line);
+      edgesLayer.append(g);
+      if (!edge.label) return;
+      const labelX = (source.x + target.x) / 2;
+      const labelY = (source.y + target.y) / 2 + 14;
+      const labelWidth = Math.max(34, edge.label.length * 14 + 18);
+      const labelGroup = svgElement("g");
+      labelGroup.id = edge.id + "-label";
+      const background = svgElement("rect");
+      setAttributes(background, { x: labelX - labelWidth / 2, y: labelY - 12, width: labelWidth, height: 24, rx: 6, fill: "#ffffff" });
+      const text = svgElement("text");
+      setAttributes(text, { x: labelX, y: labelY, "text-anchor": "middle", "dominant-baseline": "central", fill: "#172026", "font-family": "system-ui, sans-serif", "font-size": 13, "font-weight": 700 });
+      text.textContent = edge.label;
+      labelGroup.append(background, text);
+      labelsLayer.append(labelGroup);
+    });
+
+    graph.nodes.forEach((node) => {
+      const g = svgElement("g");
+      g.id = node.id;
+      setAttributes(g, { transform: "translate(" + node.x + " " + node.y + ")" });
+      const circle = svgElement("circle");
+      setAttributes(circle, { cx: 0, cy: 0, r: NODE_RADIUS, fill: node.color, stroke: "#9baaa4", "stroke-width": 2 });
+      const text = svgElement("text");
+      setAttributes(text, { x: 0, y: 0, "text-anchor": "middle", "dominant-baseline": "central", fill: "#172026", "font-family": "system-ui, sans-serif", "font-size": 34, "font-weight": 700 });
+      text.textContent = node.label;
+      g.append(circle, text);
+      nodesLayer.append(g);
+    });
+
+    svg.append(groupsLayer, edgesLayer, nodesLayer, labelsLayer);
+    return svg;
+  }
+
+  ["suki-label", "suki-graph", "suki-group", "suki-node", "suki-edge"].forEach((name) => {
+    if (!customElements.get(name)) customElements.define(name, class extends HTMLElement {});
+  });
+
+  if (!customElements.get("suki-circle")) customElements.define("suki-circle", class extends HTMLElement {
+    connectedCallback() {
+      if (this.dataset.rendered) return;
+      this.dataset.rendered = "true";
+      this.replaceChildren(renderGraph(graphFromElement(this)));
+    }
+  });
+})();
+`;
+
+/**
+ * @param {string} documentName
+ * @param {string} circleMarkup
+ * @returns {string}
+ */
+function createReadonlyHtml(documentName, circleMarkup) {
+  const script = READONLY_HTML_SCRIPT.replace(/<\/script/gi, "<\\/script");
+  const title = escapeHtml(documentName || "スキサークル");
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>${title}</title>
+<style>
+body {
+  margin: 0;
+  padding: 1rem;
+  background: #f8fbfa;
+  color: #172026;
+  font-family: system-ui, sans-serif;
+}
+suki-circle {
+  display: grid;
+  min-block-size: calc(100dvh - 2rem);
+  place-items: center;
+}
+suki-circle > suki-graph {
+  display: none;
+}
+suki-circle svg {
+  display: block;
+  max-inline-size: 100%;
+  max-block-size: calc(100dvh - 2rem);
+  inline-size: auto;
+  block-size: auto;
+}
+</style>
+</head>
+<body>
+${circleMarkup}
+<script>
+${script}
+</script>
+</body>
+</html>
+`;
+}
+
+/**
+ * @param {string} url
+ * @returns {Promise<HTMLImageElement>}
+ */
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.addEventListener("load", () => resolve(image), { once: true });
+    image.addEventListener("error", () => reject(new Error("画像を生成できませんでした。")), { once: true });
+    image.src = url;
+  });
+}
+
+/**
+ * @param {HTMLCanvasElement} canvas
+ * @param {string} type
+ * @param {number} quality
+ * @returns {Promise<Blob | null>}
+ */
+function canvasToBlob(canvas, type, quality) {
+  return new Promise((resolve) => {
+    canvas.toBlob(resolve, type, quality);
+  });
+}
+
+if (!customElements.get("suki-circle")) customElements.define("suki-circle", class extends HTMLElement {
   constructor() {
     super();
 
@@ -968,13 +2099,11 @@ class SukiCircleElement extends HTMLElement {
       edges: [
         { id: "edge-e4a19c8", sourceId: "node-98ed003", targetId: "node-c31e8b4", label: "", type: "related", color: DEFAULT_EDGE_COLOR },
       ],
-      customCss: "",
     };
 
-    /** @type {SukiTool} */
-    this.tool = "select";
+    this.documentName = "スキサークル";
     /** @type {string | null} */
-    this.selectedId = "node-98ed003";
+    this.selectedId = null;
     /** @type {string | null} */
     this.pendingConnectionId = null;
     /** @type {string | null} */
@@ -985,7 +2114,7 @@ class SukiCircleElement extends HTMLElement {
     this.suppressNextEntityClickId = null;
     updateGroupGeometry(this.graph);
 
-    /** @type {{ graph: SukiGraph, selectedId: string | null, pendingConnectionId: string | null, visibleNodeActionId: string | null, viewBox: { x: number, y: number, width: number, height: number, initialized: boolean } }[]} */
+    /** @type {{ documentName: string, graph: SukiGraph, selectedId: string | null, pendingConnectionId: string | null, visibleNodeActionId: string | null, viewBox: { x: number, y: number, width: number, height: number, initialized: boolean } }[]} */
     this.undoStack = [];
     /** @type {{ id: string, startX: number, startY: number, previousX: number, previousY: number, previousTime: number, lastSpeed: number, startTime: number, entityX: number, entityY: number, memberStarts: { id: string, x: number, y: number }[], originalGroupId: string | null, originalGroupBox: { left: number, top: number, width: number, height: number } | null, groupBoxes: { id: string, left: number, top: number, width: number, height: number }[], proposedGroupNodeId: string | null, ejected: boolean, active: boolean, historySaved: boolean } | null} */
     this.drag = null;
@@ -993,6 +2122,8 @@ class SukiCircleElement extends HTMLElement {
     this.viewBox = { x: 0, y: 0, width: 0, height: 0, initialized: false };
     /** @type {{ startX: number, startY: number, viewX: number, viewY: number, moved: boolean } | null} */
     this.pan = null;
+    /** @type {{ x: number, y: number } | null} */
+    this.addHint = null;
     this.suppressNextCanvasClick = false;
     /** @type {{ time: number, x: number, y: number } | null} */
     this.lastCanvasTap = null;
@@ -1003,27 +2134,26 @@ class SukiCircleElement extends HTMLElement {
     this.suppressNextClickAfterEditing = false;
     /** @type {ResizeObserver | null} */
     this.resizeObserver = null;
-    this.skipNextRenderAnimation = false;
-    this.recreateNextRender = false;
     this.recreateCanvasNextRender = false;
+    this.urlHashUpdateScheduled = false;
   }
 
   connectedCallback() {
+    const urlInitialState = readInitialStateFromLocation();
+    this.documentName = urlInitialState?.documentName || this.readInitialDocumentNameFromMarkup();
+    const initialGraph = urlInitialState?.graph || this.readInitialGraphFromMarkup();
+    if (initialGraph) {
+      this.graph = initialGraph;
+      this.selectedId = null;
+      updateGroupGeometry(this.graph);
+    }
+
     this.innerHTML = `
       <section class="suki-shell" aria-label="スキサークル">
         <header class="suki-toolbar">
-          <strong>スキサークル</strong>
-          <div class="suki-tool-buttons" role="group" aria-label="ツール">
-            <button type="button" data-tool="select">選択</button>
-          </div>
+          <input class="suki-document-name" name="documentName" data-action="document-name" aria-label="ドキュメント名" />
           <button type="button" data-action="layout">自動配置</button>
-          <button type="button" data-action="open-custom-css">CSS</button>
-          <button type="button" data-action="export">JSON保存</button>
-          <button type="button" data-action="export-svg">SVG保存</button>
-          <label class="suki-file-button">
-            JSON読込
-            <input type="file" accept="application/json" data-action="import" />
-          </label>
+          <button type="button" data-action="export-svg">共有とエクスポート</button>
         </header>
         <div class="suki-workspace">
           <svg class="suki-canvas" tabindex="0" aria-label="相関図キャンバス" xmlns="${SVG_NS}">
@@ -1038,7 +2168,6 @@ class SukiCircleElement extends HTMLElement {
           </svg>
           <div class="suki-node-editor" contenteditable="true" role="textbox" aria-label="文字編集" hidden></div>
           <input class="suki-node-color-input" type="color" data-action="node-color-picker" aria-label="色変更" />
-          <style class="suki-custom-css"></style>
           <dialog class="suki-properties-dialog" aria-label="プロパティ">
             <form class="suki-form" method="dialog" hidden>
               <div class="suki-dialog-header">
@@ -1053,18 +2182,17 @@ class SukiCircleElement extends HTMLElement {
             </form>
             <div class="suki-empty">要素を選択してください</div>
           </dialog>
-          <dialog class="suki-custom-css-dialog" aria-label="カスタムCSS">
-            <form class="suki-custom-css-form" method="dialog">
-              <div class="suki-dialog-header">
-                <h2>カスタムCSS</h2>
-                <button type="button" data-action="close-custom-css" aria-label="閉じる">×</button>
-              </div>
-              <textarea name="customCss" spellcheck="false" placeholder="#node-98ed003 .suki-node-circle { stroke: #172026; }&#10;#edge-e4a19c8-label .suki-edge-label-background { fill: #fff2c2; }"></textarea>
-              <div class="suki-custom-css-actions">
-                <button type="button" data-action="reset-custom-css">リセット</button>
-                <button type="button" data-action="apply-custom-css">適用</button>
-              </div>
-            </form>
+          <dialog class="suki-svg-preview-dialog" aria-label="SVG画像">
+            <div class="suki-dialog-header">
+              <h2>SVG画像</h2>
+              <button type="button" data-action="close-svg-preview" aria-label="閉じる">×</button>
+            </div>
+            <div class="suki-svg-preview-actions">
+              <button type="button" data-action="download-jpeg-preview">JPEG保存</button>
+              <button type="button" data-action="download-html-preview">HTML保存</button>
+              <button type="button" data-action="download-svg-preview">SVG保存</button>
+            </div>
+            <div class="suki-svg-preview"></div>
           </dialog>
         </div>
         <button class="suki-undo-button" type="button" data-action="undo">元に戻す</button>
@@ -1072,9 +2200,7 @@ class SukiCircleElement extends HTMLElement {
     `;
 
     this.addEventListener("click", this);
-    this.addEventListener("dblclick", this);
     this.addEventListener("input", this);
-    this.addEventListener("change", this);
     this.addEventListener("pointerdown", this);
     window.addEventListener("pointermove", this);
     window.addEventListener("pointerup", this);
@@ -1082,16 +2208,32 @@ class SukiCircleElement extends HTMLElement {
       this.updateCanvasViewBox();
     });
     this.resizeObserver.observe(this.getCanvas());
-    this.applyCustomCss();
-    this.skipNextRenderAnimation = true;
-    this.recreateNextRender = true;
+    this.syncDocumentNameInput();
     this.render();
+  }
+
+  /**
+   * @returns {SukiGraph | null}
+   */
+  readInitialGraphFromMarkup() {
+    const graphElement = this.querySelector(":scope > suki-graph");
+    if (!graphElement) return null;
+    if (typeof /** @type {{ toGraph?: unknown }} */ (graphElement).toGraph !== "function") return null;
+    return /** @type {any} */ (graphElement).toGraph();
+  }
+
+  /**
+   * @returns {string}
+   */
+  readInitialDocumentNameFromMarkup() {
+    return this.getAttribute("title")?.trim() || "スキサークル";
   }
 
   disconnectedCallback() {
     window.removeEventListener("pointermove", this);
     window.removeEventListener("pointerup", this);
     this.resizeObserver?.disconnect();
+    this.clearAddHint();
   }
 
   /**
@@ -1099,9 +2241,7 @@ class SukiCircleElement extends HTMLElement {
    */
   handleEvent(event) {
     if (event.type === "click") this.onClick(event);
-    if (event.type === "dblclick") this.onDoubleClick(event);
     if (event.type === "input") this.onInput(event);
-    if (event.type === "change") this.onChange(event);
     if (event.type === "pointerdown") this.onPointerDown(event);
     if (event.type === "pointermove") this.onPointerMove(event);
     if (event.type === "pointerup") this.onPointerUp(event);
@@ -1118,22 +2258,11 @@ class SukiCircleElement extends HTMLElement {
       return;
     }
 
-    const toolButton = target.closest("[data-tool]");
     const actionButton = target.closest("[data-action]");
     const entity = target.closest("[data-entity-kind]");
 
-    if (this.suppressNextCanvasClick && target.closest(".suki-canvas") && !toolButton && !actionButton && !entity) {
+    if (this.suppressNextCanvasClick && target.closest(".suki-canvas") && !actionButton && !entity) {
       this.suppressNextCanvasClick = false;
-      return;
-    }
-
-    if (toolButton instanceof HTMLElement) {
-      this.tool = /** @type {SukiTool} */ (toolButton.dataset.tool);
-      this.pendingConnectionId = null;
-      this.visibleNodeActionId = null;
-      this.lastCanvasTap = null;
-      this.lastNodeTap = null;
-      this.render();
       return;
     }
 
@@ -1169,28 +2298,38 @@ class SukiCircleElement extends HTMLElement {
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "open-custom-css") {
-      this.openCustomCssDialog();
+    if (actionButton instanceof Element && actionButton.dataset.action === "close-svg-preview") {
+      this.closeSvgPreviewDialog();
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "close-custom-css") {
-      this.closeCustomCssDialog();
+    if (actionButton instanceof Element && actionButton.dataset.action === "download-svg-preview") {
+      this.downloadSvgPreview();
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "apply-custom-css") {
-      this.saveCustomCssFromDialog();
+    if (actionButton instanceof Element && actionButton.dataset.action === "download-html-preview") {
+      this.downloadReadonlyHtml();
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "reset-custom-css") {
-      this.resetCustomCssInDialog();
+    if (actionButton instanceof Element && actionButton.dataset.action === "download-jpeg-preview") {
+      this.downloadJpegPreview();
       return;
     }
 
     if (actionButton instanceof Element && actionButton.dataset.action === "undo") {
       this.undo();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "add-node-at") {
+      const x = Number(actionButton.dataset.x);
+      const y = Number(actionButton.dataset.y);
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        this.clearAddHint();
+        this.addNodeAt(x, y);
+      }
       return;
     }
 
@@ -1213,13 +2352,8 @@ class SukiCircleElement extends HTMLElement {
       return;
     }
 
-    if (actionButton instanceof Element && actionButton.dataset.action === "export") {
-      this.exportJson();
-      return;
-    }
-
     if (actionButton instanceof Element && actionButton.dataset.action === "export-svg") {
-      this.exportSvg();
+      this.openSvgPreviewDialog();
       return;
     }
 
@@ -1252,15 +2386,15 @@ class SukiCircleElement extends HTMLElement {
   /**
    * @param {Event} event
    */
-  onDoubleClick(event) {
-    event.preventDefault();
-  }
-
-  /**
-   * @param {Event} event
-   */
   onInput(event) {
     const input = /** @type {HTMLInputElement | HTMLSelectElement} */ (event.target);
+    if (input instanceof HTMLInputElement && input.dataset.action === "document-name") {
+      this.pushUndoSnapshot();
+      this.documentName = input.value;
+      document.title = this.documentName || "スキサークル";
+      return;
+    }
+
     if (input instanceof HTMLInputElement && input.dataset.action === "node-color-picker") {
       this.applyPickedColor(input);
       return;
@@ -1284,37 +2418,6 @@ class SukiCircleElement extends HTMLElement {
     }
     if (input.name === "groupId" && "groupId" in entity) entity.groupId = input.value || null;
     this.render();
-  }
-
-  /**
-   * @param {Event} event
-   */
-  onChange(event) {
-    const input = /** @type {HTMLInputElement} */ (event.target);
-    if (input.dataset.action === "node-color-picker") {
-      this.applyPickedColor(input);
-      return;
-    }
-
-    if (input.dataset.action !== "import" || !input.files?.[0]) return;
-
-    const reader = new FileReader();
-    reader.addEventListener("load", () => {
-      try {
-        const nextGraph = JSON.parse(String(reader.result));
-        this.pushUndoSnapshot();
-        this.graph = nextGraph;
-        this.graph.customCss ||= "";
-        this.selectedId = null;
-        this.pendingConnectionId = null;
-        this.visibleNodeActionId = null;
-        this.applyCustomCss();
-        this.render();
-      } catch {
-        alert("JSONを読み込めませんでした。");
-      }
-    });
-    reader.readAsText(input.files[0]);
   }
 
   /**
@@ -1355,7 +2458,7 @@ class SukiCircleElement extends HTMLElement {
       }
       return;
     }
-    if (!(entityElement instanceof SVGElement) || !entityElement.dataset.id || this.tool !== "select") {
+    if (!(entityElement instanceof SVGElement) || !entityElement.dataset.id) {
       if (target.closest(".suki-canvas") && !entityElement && !actionButton) {
         this.lastNodeTap = null;
         this.startCanvasPan(pointer);
@@ -1365,6 +2468,7 @@ class SukiCircleElement extends HTMLElement {
 
     const entity = findEntity(this.graph, entityElement.dataset.id);
     if (!entity) return;
+    this.clearAddHint();
     const entityKind = getEntityKind(this.graph, entity);
     if (entityKind === "edge") {
       pointer.preventDefault();
@@ -1598,18 +2702,31 @@ class SukiCircleElement extends HTMLElement {
    * @param {PointerEvent} pointer
    */
   startCanvasPan(pointer) {
+    this.startCanvasPanFrom(pointer, pointer.clientX, pointer.clientY);
+  }
+
+  /**
+   * @param {PointerEvent} pointer
+   * @param {number} startX
+   * @param {number} startY
+   */
+  startCanvasPanFrom(pointer, startX, startY) {
     const canvas = this.getCanvas();
     this.updateCanvasViewBox();
     pointer.preventDefault();
     canvas.setPointerCapture(pointer.pointerId);
     canvas.classList.add("is-panning");
     this.pan = {
-      startX: pointer.clientX,
-      startY: pointer.clientY,
+      startX,
+      startY,
       viewX: this.viewBox.x,
       viewY: this.viewBox.y,
       moved: false,
     };
+  }
+
+  clearAddHint() {
+    this.addHint = null;
   }
 
   /**
@@ -1642,64 +2759,18 @@ class SukiCircleElement extends HTMLElement {
     if (this.pendingConnectionId) {
       this.pendingConnectionId = null;
       this.lastCanvasTap = null;
+      this.clearAddHint();
       this.render();
       return;
     }
 
     const point = this.getCanvasPoint(event);
-    if (this.tool === "select" && this.consumeCanvasDoubleTap(point.x, point.y)) {
-      this.addNodeAt(point.x, point.y);
-      return;
-    }
-
-    if (this.tool === "node") {
-      this.lastCanvasTap = null;
-      this.addNodeAt(point.x, point.y);
-      return;
-    }
-
-    if (this.tool === "group") {
-      this.lastCanvasTap = null;
-      this.pushUndoSnapshot();
-      const group = {
-        id: makeUniqueId(this.graph, "group"),
-        label: `グループ${this.graph.groups.length + 1}`,
-        x: point.x,
-        y: point.y,
-        width: GROUP_MIN_WIDTH,
-        height: GROUP_MIN_HEIGHT,
-        color: GROUP_PALETTE[this.graph.groups.length % GROUP_PALETTE.length],
-      };
-      this.graph.groups.push(group);
-      this.selectedId = group.id;
-      this.visibleNodeActionId = null;
-      this.render();
-      return;
-    }
-
     this.selectedId = null;
     this.pendingConnectionId = null;
     this.visibleNodeActionId = null;
-    this.render();
-  }
-
-  /**
-   * @param {number} x
-   * @param {number} y
-   * @returns {boolean}
-   */
-  consumeCanvasDoubleTap(x, y) {
-    const now = performance.now();
-    const previous = this.lastCanvasTap;
-    this.lastCanvasTap = { time: now, x, y };
-    if (!previous) return false;
-
-    const elapsed = now - previous.time;
-    const distance = Math.hypot(x - previous.x, y - previous.y);
-    if (elapsed > DOUBLE_TAP_MS || distance > DOUBLE_TAP_DISTANCE) return false;
-
     this.lastCanvasTap = null;
-    return true;
+    this.addHint = { x: point.x, y: point.y };
+    this.render();
   }
 
   /**
@@ -1749,6 +2820,8 @@ class SukiCircleElement extends HTMLElement {
     this.graph.nodes.push(node);
     this.selectedId = node.id;
     this.visibleNodeActionId = null;
+    this.lastCanvasTap = null;
+    this.clearAddHint();
     this.render();
   }
 
@@ -1759,6 +2832,7 @@ class SukiCircleElement extends HTMLElement {
     const node = this.graph.nodes.find((item) => item.id === id);
     const entity = findEntity(this.graph, id);
     this.lastCanvasTap = null;
+    this.clearAddHint();
     if (this.pendingConnectionId) {
       if (node && this.pendingConnectionId !== id && !hasEdge(this.graph, this.pendingConnectionId, id)) {
         this.pushUndoSnapshot();
@@ -1788,7 +2862,6 @@ class SukiCircleElement extends HTMLElement {
   startConnectionFromSelectedNode() {
     const node = this.selectedId ? this.graph.nodes.find((item) => item.id === this.selectedId) : null;
     if (!node) return;
-    this.tool = "select";
     this.pendingConnectionId = node.id;
     this.visibleNodeActionId = null;
     this.render();
@@ -1905,6 +2978,7 @@ class SukiCircleElement extends HTMLElement {
 
   createHistorySnapshot() {
     return {
+      documentName: this.documentName,
       graph: cloneGraph(this.graph),
       selectedId: this.selectedId,
       pendingConnectionId: this.pendingConnectionId,
@@ -1920,6 +2994,22 @@ class SukiCircleElement extends HTMLElement {
     this.undoStack.push(snapshot);
     if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift();
     this.updateUndoButton();
+    this.scheduleUrlHashUpdate();
+  }
+
+  scheduleUrlHashUpdate() {
+    if (this.urlHashUpdateScheduled) return;
+    this.urlHashUpdateScheduled = true;
+    queueMicrotask(() => {
+      this.urlHashUpdateScheduled = false;
+      this.updateUrlHash();
+    });
+  }
+
+  updateUrlHash() {
+    const query = createUrlQueryFromGraph(this.graph, this.documentName || "スキサークル");
+    const nextUrl = `${location.pathname}${location.search}#?${query}`;
+    history.replaceState(history.state, "", nextUrl);
   }
 
   updateUndoButton() {
@@ -1932,6 +3022,7 @@ class SukiCircleElement extends HTMLElement {
     if (!snapshot) return;
 
     this.graph = cloneGraph(snapshot.graph);
+    this.documentName = snapshot.documentName || "スキサークル";
     this.selectedId = snapshot.selectedId;
     this.pendingConnectionId = snapshot.pendingConnectionId;
     this.visibleNodeActionId = snapshot.visibleNodeActionId;
@@ -1947,80 +3038,10 @@ class SukiCircleElement extends HTMLElement {
       editor.textContent = "";
       editor.classList.remove("is-group-editor", "is-node-editor", "is-edge-editor");
     }
-    this.applyCustomCss();
-    this.skipNextRenderAnimation = true;
     this.recreateCanvasNextRender = true;
+    this.syncDocumentNameInput();
     this.render();
-  }
-
-  applyCustomCss() {
-    const style = this.querySelector(".suki-custom-css");
-    if (!(style instanceof HTMLStyleElement)) return;
-    style.textContent = this.graph.customCss || "";
-  }
-
-  openCustomCssDialog() {
-    const dialog = this.querySelector(".suki-custom-css-dialog");
-    const textarea = this.querySelector(".suki-custom-css-form textarea");
-    if (!(dialog instanceof HTMLDialogElement) || !(textarea instanceof HTMLTextAreaElement)) return;
-    textarea.value = this.graph.customCss || "";
-    if (!dialog.open) dialog.showModal();
-    textarea.focus();
-  }
-
-  closeCustomCssDialog() {
-    const dialog = this.querySelector(".suki-custom-css-dialog");
-    if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
-  }
-
-  saveCustomCssFromDialog() {
-    const textarea = this.querySelector(".suki-custom-css-form textarea");
-    if (!(textarea instanceof HTMLTextAreaElement)) return;
-    this.pushUndoSnapshot();
-    this.graph.customCss = textarea.value;
-    this.applyCustomCss();
-    this.closeCustomCssDialog();
-  }
-
-  resetCustomCssInDialog() {
-    const textarea = this.querySelector(".suki-custom-css-form textarea");
-    if (!(textarea instanceof HTMLTextAreaElement)) return;
-    this.pushUndoSnapshot();
-    textarea.value = this.createCustomCssTemplate();
-    this.graph.customCss = textarea.value;
-    this.applyCustomCss();
-  }
-
-  /**
-   * @returns {string}
-   */
-  createCustomCssTemplate() {
-    const blocks = [];
-    this.graph.nodes.forEach((node) => {
-      blocks.push(this.createCustomCssBlock(node.id, `node: ${node.label}`));
-    });
-    this.graph.groups.forEach((group) => {
-      blocks.push(this.createCustomCssBlock(group.id, `group: ${group.label}`));
-    });
-    this.graph.edges.forEach((edge) => {
-      const source = this.graph.nodes.find((node) => node.id === edge.sourceId);
-      const target = this.graph.nodes.find((node) => node.id === edge.targetId);
-      const sourceLabel = source?.label || edge.sourceId;
-      const targetLabel = target?.label || edge.targetId;
-      blocks.push(this.createCustomCssBlock(edge.id, `edge: ${sourceLabel} - ${targetLabel}`));
-      if (edge.label) blocks.push(this.createCustomCssBlock(`${edge.id}-label`, `edge label: ${edge.label}`));
-    });
-    return `${blocks.join("\n\n")}\n`;
-  }
-
-  /**
-   * @param {string} id
-   * @param {string} comment
-   * @returns {string}
-   */
-  createCustomCssBlock(id, comment) {
-    const safeComment = comment.replace(/\*\//g, "* /").replace(/\r?\n/g, " / ");
-    return `/* ${safeComment} */\n${cssIdSelector(id)} {\n}`;
+    this.updateUrlHash();
   }
 
   /**
@@ -2168,60 +3189,111 @@ class SukiCircleElement extends HTMLElement {
     this.render();
   }
 
-  exportJson() {
-    const blob = new Blob([JSON.stringify(this.graph, null, 2)], { type: "application/json" });
+  /**
+   * @returns {HTMLElement}
+   */
+  toGraphElement() {
+    return sukiElementConstructor("suki-graph").fromGraph(this.graph);
+  }
+
+  /**
+   * @returns {string}
+   */
+  toGraphMarkup() {
+    return this.toGraphElement().toMarkup();
+  }
+
+  /**
+   * @returns {string}
+   */
+  toCircleMarkup() {
+    const circle = document.createElement("suki-circle");
+    circle.setAttribute("title", this.documentName || "スキサークル");
+    circle.append(this.toGraphElement());
+    return circle.outerHTML;
+  }
+
+  /**
+   * @returns {SVGSVGElement}
+   */
+  toSvgDocument() {
+    return this.toGraphElement().toSvgDocument();
+  }
+
+  openSvgPreviewDialog() {
+    const dialog = this.querySelector(".suki-svg-preview-dialog");
+    const preview = this.querySelector(".suki-svg-preview");
+    if (!(dialog instanceof HTMLDialogElement) || !(preview instanceof HTMLElement)) return;
+
+    const svg = this.toSvgDocument();
+    svg.classList.add("suki-svg-preview-image");
+    preview.replaceChildren(svg);
+    if (!dialog.open) dialog.showModal();
+  }
+
+  closeSvgPreviewDialog() {
+    const dialog = this.querySelector(".suki-svg-preview-dialog");
+    if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
+  }
+
+  downloadSvgPreview() {
+    const previewSvg = this.querySelector(".suki-svg-preview svg");
+    const svg = previewSvg instanceof SVGSVGElement ? /** @type {SVGSVGElement} */ (previewSvg.cloneNode(true)) : this.toSvgDocument();
+    const source = prettyPrintSvg(new XMLSerializer().serializeToString(svg));
+    const blob = new Blob([source], { type: "image/svg+xml" });
+    this.downloadBlob(blob, `${fileNameStem(this.documentName)}.svg`);
+  }
+
+  downloadReadonlyHtml() {
+    const blob = new Blob([createReadonlyHtml(this.documentName || "スキサークル", this.toCircleMarkup())], { type: "text/html" });
+    this.downloadBlob(blob, `${fileNameStem(this.documentName)}.html`);
+  }
+
+  async downloadJpegPreview() {
+    const previewSvg = this.querySelector(".suki-svg-preview svg");
+    const svg = previewSvg instanceof SVGSVGElement ? /** @type {SVGSVGElement} */ (previewSvg.cloneNode(true)) : this.toSvgDocument();
+    const source = prettyPrintSvg(new XMLSerializer().serializeToString(svg));
+    const blob = new Blob([source], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    try {
+      const image = await loadImage(url);
+      const width = Math.max(1, Math.ceil(Number(svg.getAttribute("width")) || image.naturalWidth || image.width));
+      const height = Math.max(1, Math.ceil(Number(svg.getAttribute("height")) || image.naturalHeight || image.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) return;
+      context.fillStyle = "#ffffff";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(image, 0, 0, width, height);
+      const jpegBlob = await canvasToBlob(canvas, "image/jpeg", 0.9);
+      if (!jpegBlob) return;
+      this.downloadBlob(jpegBlob, `${fileNameStem(this.documentName)}.jpg`);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  /**
+   * @param {Blob} blob
+   * @param {string} filename
+   */
+  downloadBlob(blob, filename) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "suki-circle.json";
+    anchor.download = filename;
+    document.body.append(anchor);
     anchor.click();
+    anchor.remove();
     URL.revokeObjectURL(url);
   }
 
-  exportSvg() {
-    const canvas = this.getCanvas();
-    const clone = /** @type {SVGSVGElement} */ (canvas.cloneNode(true));
-    clone.setAttribute("width", String(CANVAS_WORLD_WIDTH));
-    clone.setAttribute("height", String(CANVAS_WORLD_HEIGHT));
-    clone.setAttribute("viewBox", `0 0 ${CANVAS_WORLD_WIDTH} ${CANVAS_WORLD_HEIGHT}`);
-    clone.removeAttribute("tabindex");
-    clone.removeAttribute("aria-label");
-    clone.querySelector(".suki-node-actions")?.remove();
-    clone.querySelector(".suki-edge-hit-areas")?.remove();
-
-    clone.querySelectorAll(".suki-node").forEach((element) => {
-      const svg = /** @type {SVGElement} */ (element);
-      if (!svg.dataset.x || !svg.dataset.y) return;
-      svg.setAttribute("transform", `translate(${svg.dataset.x} ${svg.dataset.y})`);
-      svg.removeAttribute("style");
-    });
-    clone.querySelectorAll("[data-suki-animation]").forEach((element) => element.remove());
-    clone.querySelectorAll(".suki-group-box").forEach((element) => {
-      const rect = /** @type {SVGElement} */ (element);
-      if (rect.dataset.x) rect.setAttribute("x", rect.dataset.x);
-      if (rect.dataset.y) rect.setAttribute("y", rect.dataset.y);
-      if (rect.dataset.width) rect.setAttribute("width", rect.dataset.width);
-      if (rect.dataset.height) rect.setAttribute("height", rect.dataset.height);
-      rect.removeAttribute("style");
-    });
-    clone.querySelectorAll(".suki-group-label").forEach((element) => {
-      const text = /** @type {SVGElement} */ (element);
-      if (text.dataset.x) text.setAttribute("x", text.dataset.x);
-      if (text.dataset.y) text.setAttribute("y", text.dataset.y);
-    });
-
-    const style = svgElement("style");
-    style.textContent = `${EXPORTED_SVG_STYLE}\n${this.graph.customCss || ""}`;
-    clone.prepend(style);
-
-    const source = new XMLSerializer().serializeToString(clone);
-    const blob = new Blob([source], { type: "image/svg+xml" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "suki-circle.svg";
-    anchor.click();
-    URL.revokeObjectURL(url);
+  syncDocumentNameInput() {
+    const input = this.querySelector('[data-action="document-name"]');
+    if (input instanceof HTMLInputElement) input.value = this.documentName;
+    document.title = this.documentName || "スキサークル";
   }
 
   /**
@@ -2231,10 +3303,9 @@ class SukiCircleElement extends HTMLElement {
     if (this.recreateCanvasNextRender) {
       this.recreateCanvas();
       this.recreateCanvasNextRender = false;
-      this.recreateNextRender = false;
     }
     const canvas = this.getCanvas();
-    const disableAnimation = this.drag || this.skipNextRenderAnimation;
+    const disableAnimation = Boolean(this.drag);
     if (disableAnimation) {
       canvas.classList.add("is-animation-disabled");
       canvas.querySelectorAll("[data-suki-animation]").forEach((element) => element.remove());
@@ -2243,9 +3314,6 @@ class SukiCircleElement extends HTMLElement {
     if (!options.freezeGroups) updateGroupGeometry(this.graph);
     this.updateCanvasViewBox();
 
-    this.querySelectorAll("[data-tool]").forEach((button) => {
-      button.classList.toggle("is-active", button instanceof HTMLElement && button.dataset.tool === this.tool);
-    });
     const undoButton = this.querySelector('[data-action="undo"]');
     if (undoButton instanceof HTMLButtonElement) undoButton.disabled = this.undoStack.length === 0;
 
@@ -2256,19 +3324,8 @@ class SukiCircleElement extends HTMLElement {
     const edgeHitAreasLayer = this.querySelector(".suki-edge-hit-areas");
     const nodeActionsLayer = this.querySelector(".suki-node-actions");
     if (!groupsLayer || !nodesLayer || !edgesLayer || !edgeLabelsLayer || !edgeHitAreasLayer || !nodeActionsLayer) return;
-    if (this.recreateNextRender) {
-      groupsLayer.replaceChildren();
-      nodesLayer.replaceChildren();
-      edgesLayer.replaceChildren();
-      edgeLabelsLayer.replaceChildren();
-      edgeHitAreasLayer.replaceChildren();
-      nodeActionsLayer.replaceChildren();
-      this.recreateNextRender = false;
-    }
     const moveDuration = disableAnimation ? 0 : MOVE_ANIMATION_MS;
     const resizeDuration = disableAnimation ? 0 : GROUP_RESIZE_ANIMATION_MS;
-    const shouldRestoreAnimation = this.skipNextRenderAnimation;
-    this.skipNextRenderAnimation = false;
 
     const draftGroup = this.getDraftGroup();
     const renderedGroups = draftGroup ? [...this.graph.groups, draftGroup] : this.graph.groups;
@@ -2338,15 +3395,20 @@ class SukiCircleElement extends HTMLElement {
       if (element) renderSvgGroupAction(element, actionGroup);
     }
 
+    let addHintElement = nodeActionsLayer.querySelector(".suki-add-hint");
+    if (this.addHint) {
+      if (!(addHintElement instanceof SVGElement)) {
+        addHintElement = svgElement("g");
+        nodeActionsLayer.append(addHintElement);
+      }
+      renderSvgAddHint(addHintElement, this.addHint);
+    } else {
+      addHintElement?.remove();
+    }
+
     this.positionNodeEditor();
     this.renderInspector();
-    if (shouldRestoreAnimation) {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          canvas.classList.remove("is-animation-disabled");
-        });
-      });
-    } else if (!this.drag) {
+    if (!this.drag) {
       canvas.classList.remove("is-animation-disabled");
     }
   }
@@ -2523,6 +3585,4 @@ class SukiCircleElement extends HTMLElement {
       return isPointInsideBox(box, x, y);
     }) || null;
   }
-}
-
-customElements.define("suki-circle", SukiCircleElement);
+});
