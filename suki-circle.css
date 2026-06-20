@@ -1,0 +1,583 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Kaito Udagawa
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+:root {
+  color: #172026;
+  background: #f4f7f6;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+button,
+.suki-file-button {
+  min-height: 2.25rem;
+  border: 1px solid #bdc9c4;
+  border-radius: 0.4rem;
+  background: #ffffff;
+  color: #172026;
+  cursor: pointer;
+}
+
+button {
+  padding: 0.35rem 0.7rem;
+}
+
+button:hover,
+.suki-file-button:hover {
+  border-color: #6b8f86;
+}
+
+button.is-active {
+  border-color: #397b8f;
+  background: #dff5ff;
+}
+
+suki-circle {
+  display: block;
+  min-height: 100dvh;
+}
+
+.suki-shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 100dvh;
+}
+
+.suki-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border-bottom: 1px solid #d4ddda;
+  background: #fafdff;
+}
+
+.suki-toolbar strong {
+  margin-right: 0.5rem;
+  font-size: 1.1rem;
+}
+
+.suki-tool-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.suki-file-button {
+  display: inline-grid;
+  place-items: center;
+  padding: 0.35rem 0.7rem;
+}
+
+.suki-file-button input {
+  position: fixed;
+  inline-size: 1px;
+  block-size: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.suki-node-color-input {
+  position: fixed;
+  left: 0;
+  top: 0;
+  opacity: 0.01;
+  pointer-events: none;
+}
+
+.suki-workspace {
+  display: block;
+  min-height: 0;
+  position: relative;
+}
+
+.suki-canvas {
+  --suki-grid-size-x: 32px;
+  --suki-grid-size-y: 32px;
+  --suki-grid-x: 0px;
+  --suki-grid-y: 0px;
+  display: block;
+  inline-size: 100%;
+  block-size: 100%;
+  min-height: calc(100dvh - 4rem);
+  overflow: hidden;
+  background:
+    linear-gradient(#e7eeeb 1px, transparent 1px),
+    linear-gradient(90deg, #e7eeeb 1px, transparent 1px),
+    #f8fbfa;
+  background-position: var(--suki-grid-x) var(--suki-grid-y);
+  background-size: var(--suki-grid-size-x) var(--suki-grid-size-y);
+  touch-action: none;
+  cursor: grab;
+}
+
+.suki-canvas.is-panning {
+  cursor: grabbing;
+}
+
+.suki-canvas.is-animation-disabled .suki-node,
+.suki-canvas.is-animation-disabled .suki-group,
+.suki-canvas.is-animation-disabled .suki-edge-line {
+  transition: none !important;
+}
+
+.suki-undo-button {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 3;
+  inline-size: auto;
+  block-size: auto;
+  min-height: 3rem;
+  padding: 0.65rem 1.15rem;
+  border-radius: 0.6rem;
+  font-size: 1rem;
+  font-weight: 700;
+  box-shadow: 0 0.5rem 1.25rem rgb(26 40 36 / 0.16);
+}
+
+.suki-undo-button:disabled {
+  cursor: default;
+}
+
+.suki-groups,
+.suki-edges,
+.suki-nodes {
+  transform-box: fill-box;
+}
+
+.suki-nodes {
+  pointer-events: none;
+}
+
+.suki-node-actions {
+  pointer-events: none;
+}
+
+.suki-edge-labels {
+  pointer-events: none;
+}
+
+.suki-edge-label-item {
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.suki-edge-hit-areas {
+  pointer-events: auto;
+}
+
+.suki-edge-hit-area {
+  cursor: pointer;
+}
+
+.suki-edges {
+  pointer-events: auto;
+}
+
+.suki-node {
+  pointer-events: auto;
+}
+
+.suki-node-action {
+  animation: suki-node-action-fade-in 220ms ease-out both;
+  cursor: pointer;
+  pointer-events: auto;
+  user-select: none;
+}
+
+@keyframes suki-node-action-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.suki-edge {
+  cursor: pointer;
+}
+
+.suki-edge-hit-line {
+  pointer-events: stroke;
+  stroke: transparent;
+  stroke-linecap: round;
+  stroke-width: 20;
+}
+
+.suki-edge[data-type="strong"] .suki-edge-hit-line {
+  stroke-width: 32;
+}
+
+.suki-edge-line {
+  pointer-events: none;
+  stroke: #4f5653;
+  stroke-width: 5;
+  stroke-linecap: round;
+  transition: x1 180ms ease, y1 180ms ease, x2 180ms ease, y2 180ms ease;
+}
+
+.suki-edge[data-type="strong"] .suki-edge-line {
+  stroke-width: 8;
+}
+
+.suki-edge.is-selected .suki-edge-line {
+  stroke-width: 10;
+  filter: drop-shadow(0 0 0.35rem rgb(95 178 203 / 0.75));
+}
+
+.suki-edge-label-background {
+  fill: #ffffff;
+  pointer-events: none;
+}
+
+.suki-edge-label {
+  fill: #172026;
+  font-size: 0.82rem;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.suki-edge-delete-action .suki-node-action-box,
+.suki-group-delete-action .suki-node-action-box {
+  stroke: #b84d3e;
+}
+
+.suki-edge-delete-action:hover .suki-node-action-box,
+.suki-group-delete-action:hover .suki-node-action-box {
+  fill: #fff1ee;
+}
+
+.suki-group,
+.suki-node {
+  user-select: none;
+  cursor: grab;
+  will-change: transform;
+}
+
+.suki-node {
+  transition:
+    transform 180ms ease,
+    filter 120ms ease;
+}
+
+.suki-group {
+  transition: filter 120ms ease;
+}
+
+.suki-group.is-draft {
+  pointer-events: none;
+}
+
+.suki-group.is-draft .suki-group-box {
+  stroke-dasharray: 8 6;
+}
+
+.suki-group-box {
+  stroke-width: 2;
+  fill-opacity: 0.22;
+}
+
+.suki-group-label {
+  color: #24342f;
+  fill: #24342f;
+  font-weight: 700;
+  font-size: 0.95rem;
+  pointer-events: none;
+}
+
+.suki-node-circle {
+  stroke: #9baaa4;
+  stroke-width: 2;
+  filter: drop-shadow(0 0.35rem 0.45rem rgb(26 40 36 / 0.13));
+}
+
+.suki-node-label {
+  color: #172026;
+  fill: #172026;
+  font-weight: 700;
+  font-size: 2.15rem;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.suki-node-editor {
+  position: absolute;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  min-inline-size: 2.75rem;
+  min-block-size: 2.75rem;
+  border: 2px solid #125e75;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #172026;
+  font-size: 2.15rem;
+  font-weight: 700;
+  line-height: 1;
+  outline: 0;
+  overflow: hidden;
+  padding: 0.25rem;
+  text-align: center;
+  word-break: break-all;
+}
+
+.suki-node-editor:focus {
+  box-shadow: 0 0 0 0.35rem rgb(95 178 203 / 0.28);
+}
+
+.suki-node-editor.is-group-editor {
+  display: block;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  line-height: 1.35;
+  overflow: auto;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+.suki-node-editor.is-edge-editor {
+  display: block;
+  border: 1.5px solid #4f5653;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  line-height: 1.25;
+  overflow: hidden;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.suki-node-action-box {
+  fill: #ffffff;
+  stroke: #397b8f;
+  stroke-width: 1.5;
+  filter: drop-shadow(0 0.25rem 0.35rem rgb(26 40 36 / 0.12));
+}
+
+.suki-node-connect-action:hover .suki-node-action-box {
+  fill: #dff5ff;
+}
+
+.suki-node-action-label {
+  fill: #172026;
+  font-size: 0.82rem;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.suki-node-connect-action,
+.suki-node-color-action,
+.suki-node-delete-action,
+.suki-edge-delete-action,
+.suki-edge-color-action,
+.suki-group-delete-action,
+.suki-group-color-action {
+  pointer-events: auto;
+}
+
+.suki-node-color-action-swatch {
+  stroke: #397b8f;
+  stroke-width: 1.5;
+  filter: drop-shadow(0 0.25rem 0.35rem rgb(26 40 36 / 0.12));
+}
+
+.suki-node-color-action:hover .suki-node-color-action-swatch,
+.suki-edge-color-action:hover .suki-node-color-action-swatch,
+.suki-group-color-action:hover .suki-node-color-action-swatch {
+  stroke: #125e75;
+  stroke-width: 2.5;
+}
+
+.suki-node-delete-action-circle {
+  fill: #f1aaa2;
+  stroke: #d9857c;
+  stroke-width: 1.5;
+  filter: drop-shadow(0 0.25rem 0.35rem rgb(26 40 36 / 0.12));
+}
+
+.suki-node-delete-action-minus {
+  pointer-events: none;
+  stroke: #ffffff;
+  stroke-linecap: round;
+  stroke-width: 3.5;
+}
+
+.suki-node-delete-action:hover .suki-node-delete-action-circle {
+  fill: #e88f86;
+  stroke: #c96d64;
+}
+
+.suki-properties-action {
+  pointer-events: auto;
+}
+
+.suki-properties-action-border {
+  fill: #ffffff;
+  stroke: #4f5653;
+  stroke-width: 1.5;
+  filter: drop-shadow(0 0.25rem 0.35rem rgb(26 40 36 / 0.12));
+}
+
+.suki-properties-action-icon {
+  fill: none;
+  stroke: #4f5653;
+  stroke-linecap: round;
+  stroke-width: 2.4;
+  pointer-events: none;
+}
+
+.suki-properties-action:hover .suki-properties-action-border {
+  stroke: #172026;
+}
+
+.suki-properties-action:hover .suki-properties-action-icon {
+  stroke: #172026;
+}
+
+.suki-node.is-selected .suki-node-circle,
+.suki-group.is-selected .suki-group-box {
+  stroke: #125e75;
+  filter: drop-shadow(0 0 0.35rem rgb(95 178 203 / 0.8));
+}
+
+.suki-node.is-pending .suki-node-circle,
+.suki-group.is-pending .suki-group-box {
+  stroke: #d15f4d;
+  filter: drop-shadow(0 0 0.4rem rgb(209 95 77 / 0.75));
+}
+
+.suki-properties-dialog,
+.suki-custom-css-dialog {
+  inline-size: min(24rem, calc(100vw - 2rem));
+  border: 1px solid #bdc9c4;
+  border-radius: 8px;
+  padding: 1rem;
+  background: #ffffff;
+  color: #172026;
+  box-shadow: 0 1rem 2.5rem rgb(26 40 36 / 0.18);
+}
+
+.suki-properties-dialog::backdrop,
+.suki-custom-css-dialog::backdrop {
+  background: rgb(23 32 38 / 0.22);
+}
+
+.suki-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.suki-dialog-header h2 {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+}
+
+.suki-dialog-header button {
+  inline-size: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.suki-empty {
+  color: #64736e;
+}
+
+.suki-form {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.suki-form label,
+.suki-custom-css-form {
+  display: grid;
+  gap: 0.3rem;
+  color: #40504b;
+  font-size: 0.9rem;
+}
+
+.suki-id-field {
+  display: grid;
+  gap: 0.3rem;
+  color: #40504b;
+  font-size: 0.9rem;
+}
+
+.suki-id-field output {
+  color: #172026;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+  user-select: text;
+}
+
+.suki-custom-css-form textarea {
+  min-block-size: 14rem;
+  min-inline-size: 0;
+  border: 1px solid #bdc9c4;
+  border-radius: 0.35rem;
+  padding: 0.65rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.suki-custom-css-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.suki-form input,
+.suki-form select {
+  min-width: 0;
+  border: 1px solid #bdc9c4;
+  border-radius: 0.35rem;
+  padding: 0.45rem;
+  background: #ffffff;
+}
+
+.suki-form input[type="color"] {
+  padding: 0.1rem;
+  block-size: 2.4rem;
+}
+
+.suki-form button[data-action="delete"] {
+  border-color: #d2a7a0;
+  background: #fff1ee;
+}
+
+@media (max-width: 760px) {
+  .suki-workspace {
+    min-height: 28rem;
+  }
+
+  .suki-canvas {
+    min-height: 28rem;
+  }
+}

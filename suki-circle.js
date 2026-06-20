@@ -1,0 +1,2528 @@
+// SPDX-FileCopyrightText: 2026 Kaito Udagawa
+//
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * @typedef {"select" | "node" | "group"} SukiTool
+ *
+ * @typedef {Object} SukiNode
+ * @property {string} id
+ * @property {string} label
+ * @property {number} x
+ * @property {number} y
+ * @property {string | null} groupId
+ * @property {string} color
+ *
+ * @typedef {Object} SukiGroup
+ * @property {string} id
+ * @property {string} label
+ * @property {number} x
+ * @property {number} y
+ * @property {number} width
+ * @property {number} height
+ * @property {string} color
+ *
+ * @typedef {Object} SukiEdge
+ * @property {string} id
+ * @property {string} sourceId
+ * @property {string} targetId
+ * @property {string} label
+ * @property {"related" | "strong" | "weak" | "oneway"} type
+ * @property {string} color
+ *
+ * @typedef {Object} SukiGraph
+ * @property {SukiNode[]} nodes
+ * @property {SukiGroup[]} groups
+ * @property {SukiEdge[]} edges
+ * @property {string=} customCss
+ *
+ * @typedef {SukiNode | SukiGroup | SukiEdge} SukiEntity
+ */
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const NODE_SIZE = 88;
+const NODE_RADIUS = NODE_SIZE / 2;
+const CANVAS_PADDING = 96;
+const GROUP_PADDING_X = 28;
+const GROUP_PADDING_TOP = 42;
+const GROUP_PADDING_BOTTOM = 24;
+const GROUP_MIN_WIDTH = 180;
+const GROUP_MIN_HEIGHT = 150;
+const CANVAS_WORLD_WIDTH = 3200;
+const CANVAS_WORLD_HEIGHT = 2200;
+const DRAG_START_THRESHOLD = 10;
+const DOUBLE_TAP_MS = 320;
+const DOUBLE_TAP_DISTANCE = 24;
+const NODE_EDIT_TAP_COUNT = 3;
+const NODE_EJECT_SPEED = 1.8;
+const NODE_EJECT_MARGIN = 24;
+const DRAFT_GROUP_ID = "__draft-group";
+const GRID_SIZE = 32;
+const UNDO_LIMIT = 80;
+const GROUP_LAYOUT_SPACING = 140;
+const GROUP_LAYOUT_RELAXATION = 0.35;
+const LOOSE_LAYOUT_RELAXATION = GROUP_LAYOUT_RELAXATION / 4;
+const GROUP_PALETTE = ["#5fb2cb", "#f08a6b", "#79a96b", "#c88dd8", "#e0b94f"];
+const NODE_PALETTE = ["#ffffff", "#fff2c2", "#dff5ff", "#f5e5ff", "#e6f6dc"];
+const DEFAULT_EDGE_COLOR = "#4f5653";
+const NODE_LABEL_CANDIDATES = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZあいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをんアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン";
+const MOVE_ANIMATION_MS = 180;
+const GROUP_RESIZE_ANIMATION_MS = 520;
+const EXPORTED_SVG_STYLE = `
+  .suki-edge { stroke: #4f5653; stroke-width: 5; stroke-linecap: round; }
+  .suki-edge[data-type="strong"] { stroke-width: 8; }
+  .suki-edge-label-background { fill: #ffffff; }
+  .suki-edge-label { fill: #172026; font: 700 13px system-ui, sans-serif; }
+  .suki-group-box { stroke-width: 2; fill-opacity: 0.22; }
+  .suki-group-label { fill: #24342f; font: 700 15px system-ui, sans-serif; }
+  .suki-node-circle { stroke: #9baaa4; stroke-width: 2; }
+  .suki-node-label { fill: #172026; font: 700 34px system-ui, sans-serif; }
+`;
+
+/**
+ * @param {string} prefix
+ * @returns {string}
+ */
+function makeId(prefix) {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("").slice(0, 7);
+  return `${prefix}-${hex}`;
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @param {string} prefix
+ * @returns {string}
+ */
+function makeUniqueId(graph, prefix) {
+  let id = makeId(prefix);
+  while (findEntity(graph, id)) {
+    id = makeId(prefix);
+  }
+  return id;
+}
+
+/**
+ * @param {string} id
+ * @returns {string}
+ */
+function cssIdSelector(id) {
+  if (globalThis.CSS?.escape) return `#${CSS.escape(id)}`;
+  return `#${id.replace(/[^a-zA-Z0-9_-]/g, "\\$&")}`;
+}
+
+/**
+ * @param {number} value
+ * @returns {string}
+ */
+function toHexByte(value) {
+  return Math.round(value).toString(16).padStart(2, "0");
+}
+
+/**
+ * @returns {string}
+ */
+function randomPastelColor() {
+  const hue = Math.random() * 360;
+  const saturation = 0.42 + Math.random() * 0.18;
+  const lightness = 0.84 + Math.random() * 0.08;
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+  const segment = hue / 60;
+  const secondary = chroma * (1 - Math.abs((segment % 2) - 1));
+  const match = lightness - chroma / 2;
+  const [red, green, blue] = segment < 1
+    ? [chroma, secondary, 0]
+    : segment < 2
+      ? [secondary, chroma, 0]
+      : segment < 3
+        ? [0, chroma, secondary]
+        : segment < 4
+          ? [0, secondary, chroma]
+          : segment < 5
+            ? [secondary, 0, chroma]
+            : [chroma, 0, secondary];
+  return `#${toHexByte((red + match) * 255)}${toHexByte((green + match) * 255)}${toHexByte((blue + match) * 255)}`;
+}
+
+/**
+ * @returns {string}
+ */
+function randomNodeLabel() {
+  return NODE_LABEL_CANDIDATES[Math.floor(Math.random() * NODE_LABEL_CANDIDATES.length)] || "A";
+}
+
+/**
+ * @param {string} text
+ * @returns {string[]}
+ */
+function getLabelLines(text) {
+  const lines = text.split(/\r?\n/);
+  return lines.length > 0 ? lines : [""];
+}
+
+/**
+ * @param {SukiEdge} edge
+ * @returns {string}
+ */
+function getEdgeColor(edge) {
+  return edge.color || DEFAULT_EDGE_COLOR;
+}
+
+/**
+ * @param {string} tagName
+ * @returns {SVGElement}
+ */
+function svgElement(tagName) {
+  return document.createElementNS(SVG_NS, tagName);
+}
+
+/**
+ * @param {Element} element
+ * @param {Record<string, string | number>} attributes
+ */
+function setAttributes(element, attributes) {
+  Object.entries(attributes).forEach(([name, value]) => {
+    element.setAttribute(name, String(value));
+  });
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @returns {SukiGraph}
+ */
+function cloneGraph(graph) {
+  return structuredClone(graph);
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @param {string} id
+ * @returns {SukiEntity | null}
+ */
+function findEntity(graph, id) {
+  return graph.nodes.find((node) => node.id === id)
+    || graph.groups.find((group) => group.id === id)
+    || graph.edges.find((edge) => edge.id === id)
+    || null;
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @param {SukiEntity} entity
+ * @returns {"node" | "group" | "edge"}
+ */
+function getEntityKind(graph, entity) {
+  if (graph.groups.some((group) => group.id === entity.id)) return "group";
+  if (graph.edges.some((edge) => edge.id === entity.id)) return "edge";
+  return "node";
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @param {string} sourceId
+ * @param {string} targetId
+ * @returns {boolean}
+ */
+function hasEdge(graph, sourceId, targetId) {
+  return graph.edges.some((edge) => {
+    return (edge.sourceId === sourceId && edge.targetId === targetId)
+      || (edge.sourceId === targetId && edge.targetId === sourceId);
+  });
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @param {string} groupId
+ * @returns {SukiNode[]}
+ */
+function getGroupMembers(graph, groupId) {
+  return graph.nodes.filter((node) => node.groupId === groupId);
+}
+
+/**
+ * @param {SukiGroup} group
+ * @returns {{ left: number, top: number, width: number, height: number }}
+ */
+function getGroupBox(group) {
+  const width = group.width || GROUP_MIN_WIDTH;
+  const height = group.height || GROUP_MIN_HEIGHT;
+  return {
+    left: group.x - width / 2,
+    top: group.y - height / 2,
+    width,
+    height,
+  };
+}
+
+/**
+ * @param {{ left: number, top: number, width: number, height: number }} box
+ * @param {number} x
+ * @param {number} y
+ * @param {number} margin
+ * @returns {boolean}
+ */
+function isPointInsideBox(box, x, y, margin = 0) {
+  return x >= box.left - margin
+    && x <= box.left + box.width + margin
+    && y >= box.top - margin
+    && y <= box.top + box.height + margin;
+}
+
+/**
+ * @param {Element} layer
+ * @param {string} selector
+ * @param {string} tagName
+ * @param {string[]} orderedIds
+ * @returns {Map<string, SVGElement>}
+ */
+function syncSvgLayerElements(layer, selector, tagName, orderedIds) {
+  const existing = new Map(
+    [...layer.querySelectorAll(selector)].map((element) => [/** @type {SVGElement} */ (element).dataset.id || "", /** @type {SVGElement} */ (element)]),
+  );
+  const elements = orderedIds.map((id) => {
+    const current = existing.get(id);
+    if (current) return current;
+    const created = svgElement(tagName);
+    created.dataset.id = id;
+    return created;
+  });
+
+  layer.replaceChildren(...elements);
+  return new Map(elements.map((element) => [element.dataset.id || "", element]));
+}
+
+/**
+ * @param {SukiNode[]} members
+ * @returns {{ x: number, y: number, width: number, height: number }}
+ */
+function getGroupGeometryForMembers(members) {
+  if (members.length === 0) {
+    return {
+      x: 0,
+      y: 0,
+      width: GROUP_MIN_WIDTH,
+      height: GROUP_MIN_HEIGHT,
+    };
+  }
+
+  const minX = Math.min(...members.map((node) => node.x - NODE_RADIUS));
+  const maxX = Math.max(...members.map((node) => node.x + NODE_RADIUS));
+  const minY = Math.min(...members.map((node) => node.y - NODE_RADIUS));
+  const maxY = Math.max(...members.map((node) => node.y + NODE_RADIUS));
+  const left = minX - GROUP_PADDING_X;
+  const top = minY - GROUP_PADDING_TOP;
+  const width = Math.max(GROUP_MIN_WIDTH, maxX - minX + GROUP_PADDING_X * 2);
+  const height = Math.max(GROUP_MIN_HEIGHT, maxY - minY + GROUP_PADDING_TOP + GROUP_PADDING_BOTTOM);
+
+  return {
+    x: left + width / 2,
+    y: top + height / 2,
+    width,
+    height,
+  };
+}
+
+/**
+ * @param {SukiGraph} graph
+ */
+function updateGroupGeometry(graph) {
+  graph.groups.forEach((group) => {
+    const members = getGroupMembers(graph, group.id);
+    if (members.length === 0) {
+      group.width = group.width || GROUP_MIN_WIDTH;
+      group.height = group.height || GROUP_MIN_HEIGHT;
+      return;
+    }
+
+    Object.assign(group, getGroupGeometryForMembers(members));
+  });
+}
+
+/**
+ * @param {SukiGraph} graph
+ * @param {{ x?: number, y?: number, width: number, height: number }} viewport
+ * @returns {SukiGraph}
+ */
+function autoLayout(graph, viewport) {
+  const next = cloneGraph(graph);
+  void viewport;
+
+  next.groups.forEach((group) => {
+    const members = getGroupMembers(next, group.id);
+    if (members.length < 2) return;
+
+    const centroidX = members.reduce((sum, node) => sum + node.x, 0) / members.length;
+    const centroidY = members.reduce((sum, node) => sum + node.y, 0) / members.length;
+    const targetRadius = members.length === 2
+      ? GROUP_LAYOUT_SPACING / 2
+      : GROUP_LAYOUT_SPACING / (2 * Math.sin(Math.PI / members.length));
+
+    members.forEach((node, index) => {
+      const currentDx = node.x - centroidX;
+      const currentDy = node.y - centroidY;
+      const currentDistance = Math.hypot(currentDx, currentDy);
+      const fallbackAngle = (-Math.PI / 2) + (Math.PI * 2 * index) / members.length;
+      const unitX = currentDistance > 0 ? currentDx / currentDistance : Math.cos(fallbackAngle);
+      const unitY = currentDistance > 0 ? currentDy / currentDistance : Math.sin(fallbackAngle);
+      const nextDistance = currentDistance + (targetRadius - currentDistance) * GROUP_LAYOUT_RELAXATION;
+      node.x = Math.min(
+        CANVAS_WORLD_WIDTH - CANVAS_PADDING,
+        Math.max(CANVAS_PADDING, centroidX + unitX * nextDistance),
+      );
+      node.y = Math.min(
+        CANVAS_WORLD_HEIGHT - CANVAS_PADDING,
+        Math.max(CANVAS_PADDING, centroidY + unitY * nextDistance),
+      );
+    });
+  });
+
+  next.nodes.filter((node) => !node.groupId).forEach((node) => {
+    const nearest = next.nodes
+      .filter((candidate) => candidate.id !== node.id)
+      .map((candidate) => ({
+        node: candidate,
+        distance: Math.hypot(candidate.x - node.x, candidate.y - node.y),
+      }))
+      .sort((left, right) => {
+        if (left.distance !== right.distance) return left.distance - right.distance;
+        return left.node.id.localeCompare(right.node.id);
+      })[0];
+    if (!nearest) return;
+
+    const dx = node.x - nearest.node.x;
+    const dy = node.y - nearest.node.y;
+    const distance = Math.max(1, nearest.distance);
+    const nextDistance = distance + (GROUP_LAYOUT_SPACING - distance) * LOOSE_LAYOUT_RELAXATION;
+    const unitX = dx / distance;
+    const unitY = dy / distance;
+    node.x = Math.min(
+      CANVAS_WORLD_WIDTH - CANVAS_PADDING,
+      Math.max(CANVAS_PADDING, nearest.node.x + unitX * nextDistance),
+    );
+    node.y = Math.min(
+      CANVAS_WORLD_HEIGHT - CANVAS_PADDING,
+      Math.max(CANVAS_PADDING, nearest.node.y + unitY * nextDistance),
+    );
+  });
+
+  updateGroupGeometry(next);
+  return next;
+}
+
+/**
+ * @param {Element} element
+ * @param {string} name
+ * @param {string | number} from
+ * @param {string | number} to
+ * @param {number} duration
+ */
+function animateSvgAttribute(element, name, from, to, duration) {
+  if (String(from) === String(to)) return;
+
+  element.querySelectorAll(`animate[data-suki-animation="${name}"]`).forEach((animation) => animation.remove());
+  const animation = svgElement("animate");
+  animation.dataset.sukiAnimation = name;
+  setAttributes(animation, {
+    attributeName: name,
+    from,
+    to,
+    dur: `${duration}ms`,
+    fill: "freeze",
+  });
+  element.append(animation);
+  if ("beginElement" in animation) animation.beginElement();
+  window.setTimeout(() => animation.remove(), duration + 50);
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {number} fromX
+ * @param {number} fromY
+ * @param {number} toX
+ * @param {number} toY
+ * @param {number} duration
+ */
+function animateSvgTransform(element, fromX, fromY, toX, toY, duration) {
+  if (fromX === toX && fromY === toY) return;
+
+  element.querySelectorAll('animateTransform[data-suki-animation="transform"]').forEach((animation) => animation.remove());
+  const animation = svgElement("animateTransform");
+  animation.dataset.sukiAnimation = "transform";
+  setAttributes(animation, {
+    attributeName: "transform",
+    type: "translate",
+    from: `${fromX} ${fromY}`,
+    to: `${toX} ${toY}`,
+    dur: `${duration}ms`,
+    fill: "freeze",
+  });
+  element.append(animation);
+  if ("beginElement" in animation) animation.beginElement();
+  window.setTimeout(() => animation.remove(), duration + 50);
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {number} x
+ * @param {number} y
+ * @param {number} duration
+ */
+function setSvgTransform(element, x, y, duration) {
+  const previousX = Number(element.dataset.x);
+  const previousY = Number(element.dataset.y);
+  const hasPrevious = Number.isFinite(previousX) && Number.isFinite(previousY);
+  if (duration > 0 && hasPrevious) {
+    animateSvgTransform(element, previousX, previousY, x, y, duration);
+  }
+
+  element.dataset.x = String(x);
+  element.dataset.y = String(y);
+  element.setAttribute("transform", `translate(${x} ${y})`);
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiGroup} group
+ * @param {boolean} selected
+ * @param {boolean} pending
+ * @param {number} moveDuration
+ * @param {number} resizeDuration
+ */
+function renderSvgGroup(element, group, selected, pending, moveDuration, resizeDuration) {
+  const box = getGroupBox(group);
+  element.classList.add("suki-group");
+  element.classList.toggle("is-selected", selected);
+  element.classList.toggle("is-pending", pending);
+  element.classList.toggle("is-draft", group.id === DRAFT_GROUP_ID);
+  element.dataset.entityKind = "group";
+  element.dataset.id = group.id;
+  element.id = group.id;
+  element.removeAttribute("transform");
+  element.removeAttribute("style");
+
+  let rect = element.querySelector(".suki-group-box");
+  if (!rect) {
+    rect = svgElement("rect");
+    rect.classList.add("suki-group-box");
+    element.append(rect);
+  }
+  const previousX = rect.dataset.x;
+  const previousY = rect.dataset.y;
+  const previousWidth = rect.dataset.width;
+  const previousHeight = rect.dataset.height;
+  setAttributes(rect, { x: box.left, y: box.top, width: box.width, height: box.height, rx: 8, fill: group.color, stroke: group.color });
+  if (moveDuration > 0 && previousX) animateSvgAttribute(rect, "x", previousX, box.left, moveDuration);
+  if (moveDuration > 0 && previousY) animateSvgAttribute(rect, "y", previousY, box.top, moveDuration);
+  if (resizeDuration > 0 && previousWidth) animateSvgAttribute(rect, "width", previousWidth, box.width, resizeDuration);
+  if (resizeDuration > 0 && previousHeight) animateSvgAttribute(rect, "height", previousHeight, box.height, resizeDuration);
+  rect.dataset.x = String(box.left);
+  rect.dataset.y = String(box.top);
+  rect.dataset.width = String(box.width);
+  rect.dataset.height = String(box.height);
+
+  let text = element.querySelector(".suki-group-label");
+  if (!text) {
+    text = svgElement("text");
+    text.classList.add("suki-group-label");
+    element.append(text);
+  }
+  const textX = box.left + 14;
+  const textY = box.top + 28;
+  const previousTextX = text.dataset.x;
+  const previousTextY = text.dataset.y;
+  setAttributes(text, { x: textX, y: textY });
+  if (moveDuration > 0 && previousTextX) animateSvgAttribute(text, "x", previousTextX, textX, moveDuration);
+  if (moveDuration > 0 && previousTextY) animateSvgAttribute(text, "y", previousTextY, textY, moveDuration);
+  text.dataset.x = String(textX);
+  text.dataset.y = String(textY);
+  text.replaceChildren(...getLabelLines(group.label).map((line, index) => {
+    const tspan = svgElement("tspan");
+    setAttributes(tspan, {
+      x: textX,
+      dy: index === 0 ? 0 : "1.25em",
+    });
+    tspan.textContent = line || " ";
+    return tspan;
+  }));
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiNode} node
+ * @param {boolean} selected
+ * @param {boolean} pending
+ * @param {number} moveDuration
+ */
+function renderSvgNode(element, node, selected, pending, moveDuration) {
+  element.classList.add("suki-node");
+  element.classList.toggle("is-selected", selected);
+  element.classList.toggle("is-pending", pending);
+  element.dataset.entityKind = "node";
+  element.dataset.id = node.id;
+  element.id = node.id;
+  setSvgTransform(element, node.x, node.y, moveDuration);
+
+  let circle = element.querySelector(".suki-node-circle");
+  if (!circle) {
+    circle = svgElement("circle");
+    circle.classList.add("suki-node-circle");
+    element.append(circle);
+  }
+  setAttributes(circle, { cx: 0, cy: 0, r: NODE_RADIUS, fill: node.color });
+
+  let text = element.querySelector(".suki-node-label");
+  if (!text) {
+    text = svgElement("text");
+    text.classList.add("suki-node-label");
+    element.append(text);
+  }
+  setAttributes(text, { x: 0, y: 0, "text-anchor": "middle", "dominant-baseline": "central" });
+  text.textContent = node.label;
+}
+
+/**
+ * @param {string} id
+ * @param {number} cx
+ * @param {number} cy
+ * @returns {SVGElement}
+ */
+function createSvgPropertiesAction(id, cx, cy) {
+  const action = svgElement("g");
+  action.classList.add("suki-properties-action");
+  action.dataset.action = "open-properties";
+  action.dataset.id = id;
+
+  const title = svgElement("title");
+  title.textContent = "プロパティ";
+
+  const border = svgElement("circle");
+  border.classList.add("suki-properties-action-border");
+  setAttributes(border, { cx, cy, r: 14 });
+
+  const icon = svgElement("g");
+  icon.classList.add("suki-properties-action-icon");
+  [-5, 0, 5].forEach((offset) => {
+    const line = svgElement("line");
+    setAttributes(line, {
+      x1: cx - 7,
+      y1: cy + offset,
+      x2: cx + 7,
+      y2: cy + offset,
+    });
+    icon.append(line);
+  });
+
+  action.append(title, border, icon);
+  return action;
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiNode} node
+ */
+function renderSvgNodeAction(element, node) {
+  const connectWidth = 48;
+  const height = 28;
+  const gap = 8;
+  const colorSize = 28;
+  const deleteSize = 28;
+  const propertiesSize = 28;
+  const totalWidth = connectWidth + gap + colorSize + gap + deleteSize;
+  const x = node.x - totalWidth / 2;
+  const y = node.y + NODE_RADIUS + 12;
+
+  element.setAttribute("class", "suki-node-action");
+  element.dataset.id = node.id;
+
+  const connectAction = svgElement("g");
+  connectAction.classList.add("suki-node-connect-action");
+  connectAction.dataset.action = "start-connect";
+  connectAction.dataset.id = node.id;
+
+  const rect = svgElement("rect");
+  rect.classList.add("suki-node-action-box");
+  setAttributes(rect, { x, y, width: connectWidth, height, rx: 6 });
+
+  const text = svgElement("text");
+  text.classList.add("suki-node-action-label");
+  setAttributes(text, {
+    x: x + connectWidth / 2,
+    y: y + height / 2,
+    "text-anchor": "middle",
+    "dominant-baseline": "central",
+  });
+  text.textContent = "接続";
+  connectAction.append(rect, text);
+
+  const colorAction = svgElement("g");
+  colorAction.classList.add("suki-node-color-action");
+  colorAction.dataset.action = "change-node-color";
+  colorAction.dataset.id = node.id;
+
+  const title = svgElement("title");
+  title.textContent = "色変更";
+  const circle = svgElement("circle");
+  circle.classList.add("suki-node-color-action-swatch");
+  setAttributes(circle, {
+    cx: x + connectWidth + gap + colorSize / 2,
+    cy: y + colorSize / 2,
+    r: colorSize / 2,
+    fill: node.color,
+  });
+  colorAction.append(title, circle);
+
+  const deleteAction = svgElement("g");
+  deleteAction.classList.add("suki-node-delete-action");
+  deleteAction.dataset.action = "delete-node";
+  deleteAction.dataset.id = node.id;
+
+  const deleteX = x + connectWidth + gap + colorSize + gap;
+  const deleteCenterX = deleteX + deleteSize / 2;
+  const deleteCenterY = y + deleteSize / 2;
+
+  const deleteTitle = svgElement("title");
+  deleteTitle.textContent = "削除";
+  const deleteCircle = svgElement("circle");
+  deleteCircle.classList.add("suki-node-delete-action-circle");
+  setAttributes(deleteCircle, {
+    cx: deleteCenterX,
+    cy: deleteCenterY,
+    r: deleteSize / 2,
+  });
+
+  const deleteMinus = svgElement("line");
+  deleteMinus.classList.add("suki-node-delete-action-minus");
+  setAttributes(deleteMinus, {
+    x1: deleteCenterX - 6,
+    y1: deleteCenterY,
+    x2: deleteCenterX + 6,
+    y2: deleteCenterY,
+  });
+  deleteAction.append(deleteTitle, deleteCircle, deleteMinus);
+
+  const propertiesAction = createSvgPropertiesAction(
+    node.id,
+    deleteCenterX,
+    node.y - NODE_RADIUS - 1 - propertiesSize / 2,
+  );
+
+  element.replaceChildren(connectAction, colorAction, deleteAction, propertiesAction);
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiGraph} graph
+ * @param {SukiEdge} edge
+ */
+function renderSvgEdgeDeleteAction(element, graph, edge) {
+  const source = graph.nodes.find((node) => node.id === edge.sourceId);
+  const target = graph.nodes.find((node) => node.id === edge.targetId);
+  if (!source || !target) return;
+
+  const width = 58;
+  const height = 28;
+  const gap = 8;
+  const colorSize = 28;
+  const propertiesSize = 28;
+  const centerX = (source.x + target.x) / 2;
+  const centerY = (source.y + target.y) / 2;
+  const totalWidth = width + gap + colorSize + gap + propertiesSize;
+  const x = centerX - totalWidth / 2;
+  const y = centerY - height - 12;
+
+  element.setAttribute("class", "suki-node-action suki-edge-action");
+  delete element.dataset.action;
+  element.dataset.id = edge.id;
+
+  const deleteAction = svgElement("g");
+  deleteAction.classList.add("suki-edge-delete-action");
+  deleteAction.dataset.action = "delete";
+  deleteAction.dataset.id = edge.id;
+
+  const rect = svgElement("rect");
+  rect.classList.add("suki-node-action-box");
+  setAttributes(rect, { x, y, width, height, rx: 6 });
+
+  const text = svgElement("text");
+  text.classList.add("suki-node-action-label");
+  setAttributes(text, {
+    x: x + width / 2,
+    y: y + height / 2,
+    "text-anchor": "middle",
+    "dominant-baseline": "central",
+  });
+  text.textContent = "削除";
+  deleteAction.append(rect, text);
+
+  const colorAction = svgElement("g");
+  colorAction.classList.add("suki-edge-color-action");
+  colorAction.dataset.action = "change-edge-color";
+  colorAction.dataset.id = edge.id;
+
+  const title = svgElement("title");
+  title.textContent = "色変更";
+  const circle = svgElement("circle");
+  circle.classList.add("suki-node-color-action-swatch");
+  setAttributes(circle, {
+    cx: x + width + gap + colorSize / 2,
+    cy: y + colorSize / 2,
+    r: colorSize / 2,
+    fill: getEdgeColor(edge),
+  });
+  colorAction.append(title, circle);
+
+  const propertiesX = x + width + gap + colorSize + gap;
+  const propertiesAction = createSvgPropertiesAction(edge.id, propertiesX + propertiesSize / 2, y + propertiesSize / 2);
+
+  element.replaceChildren(deleteAction, colorAction, propertiesAction);
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiGroup} group
+ */
+function renderSvgGroupAction(element, group) {
+  const box = getGroupBox(group);
+  const width = 58;
+  const height = 28;
+  const gap = 8;
+  const colorSize = 28;
+  const propertiesSize = 28;
+  const totalWidth = width + gap + colorSize + gap + propertiesSize;
+  const x = box.left + box.width / 2 - totalWidth / 2;
+  const y = box.top + box.height + 12;
+
+  element.setAttribute("class", "suki-node-action suki-group-action");
+  delete element.dataset.action;
+  element.dataset.id = group.id;
+
+  const deleteAction = svgElement("g");
+  deleteAction.classList.add("suki-group-delete-action");
+  deleteAction.dataset.action = "delete";
+  deleteAction.dataset.id = group.id;
+
+  const rect = svgElement("rect");
+  rect.classList.add("suki-node-action-box");
+  setAttributes(rect, { x, y, width, height, rx: 6 });
+
+  const text = svgElement("text");
+  text.classList.add("suki-node-action-label");
+  setAttributes(text, {
+    x: x + width / 2,
+    y: y + height / 2,
+    "text-anchor": "middle",
+    "dominant-baseline": "central",
+  });
+  text.textContent = "削除";
+  deleteAction.append(rect, text);
+
+  const colorAction = svgElement("g");
+  colorAction.classList.add("suki-group-color-action");
+  colorAction.dataset.action = "change-group-color";
+  colorAction.dataset.id = group.id;
+
+  const title = svgElement("title");
+  title.textContent = "色変更";
+  const circle = svgElement("circle");
+  circle.classList.add("suki-node-color-action-swatch");
+  setAttributes(circle, {
+    cx: x + width + gap + colorSize / 2,
+    cy: y + colorSize / 2,
+    r: colorSize / 2,
+    fill: group.color,
+  });
+  colorAction.append(title, circle);
+
+  const propertiesX = x + width + gap + colorSize + gap;
+  const propertiesAction = createSvgPropertiesAction(group.id, propertiesX + propertiesSize / 2, y + propertiesSize / 2);
+
+  element.replaceChildren(deleteAction, colorAction, propertiesAction);
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiGraph} graph
+ * @param {SukiEdge} edge
+ * @param {boolean} selected
+ */
+function renderSvgEdge(element, graph, edge, selected) {
+  const source = graph.nodes.find((node) => node.id === edge.sourceId);
+  const target = graph.nodes.find((node) => node.id === edge.targetId);
+  element.classList.add("suki-edge");
+  element.classList.toggle("is-selected", selected);
+  element.dataset.entityKind = "edge";
+  element.dataset.id = edge.id;
+  element.dataset.type = edge.type;
+  element.id = edge.id;
+  if (!source || !target) return;
+
+  let line = element.querySelector(".suki-edge-line");
+  if (!line) {
+    line = svgElement("line");
+    line.classList.add("suki-edge-line");
+    element.append(line);
+  }
+  line.style.stroke = getEdgeColor(edge);
+  setAttributes(line, {
+    x1: source.x,
+    y1: source.y,
+    x2: target.x,
+    y2: target.y,
+  });
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiGraph} graph
+ * @param {SukiEdge} edge
+ */
+function renderSvgEdgeHitArea(element, graph, edge) {
+  const source = graph.nodes.find((node) => node.id === edge.sourceId);
+  const target = graph.nodes.find((node) => node.id === edge.targetId);
+  element.classList.add("suki-edge-hit-area");
+  element.dataset.entityKind = "edge";
+  element.dataset.id = edge.id;
+  element.dataset.type = edge.type;
+  if (!source || !target) return;
+
+  let hitLine = element.querySelector(".suki-edge-hit-line");
+  if (!hitLine) {
+    hitLine = svgElement("line");
+    hitLine.classList.add("suki-edge-hit-line");
+    element.append(hitLine);
+  }
+  setAttributes(hitLine, {
+    x1: source.x,
+    y1: source.y,
+    x2: target.x,
+    y2: target.y,
+  });
+}
+
+/**
+ * @param {SVGElement} element
+ * @param {SukiGraph} graph
+ * @param {SukiEdge} edge
+ */
+function renderSvgEdgeLabel(element, graph, edge) {
+  const source = graph.nodes.find((node) => node.id === edge.sourceId);
+  const target = graph.nodes.find((node) => node.id === edge.targetId);
+  element.classList.add("suki-edge-label-item");
+  element.dataset.entityKind = "edge";
+  element.dataset.id = edge.id;
+  element.id = `${edge.id}-label`;
+  if (!source || !target) return;
+
+  const labelX = (source.x + target.x) / 2;
+  const labelY = (source.y + target.y) / 2 + 14;
+  const labelWidth = Math.max(34, edge.label.length * 14 + 18);
+  const labelHeight = 24;
+  let labelBackground = element.querySelector(".suki-edge-label-background");
+  if (!labelBackground) {
+    labelBackground = svgElement("rect");
+    labelBackground.classList.add("suki-edge-label-background");
+    element.append(labelBackground);
+  }
+  setAttributes(labelBackground, {
+    x: labelX - labelWidth / 2,
+    y: labelY - labelHeight / 2,
+    width: labelWidth,
+    height: labelHeight,
+    rx: 6,
+  });
+  labelBackground.toggleAttribute("hidden", !edge.label);
+
+  let label = element.querySelector(".suki-edge-label");
+  if (!label) {
+    label = svgElement("text");
+    label.classList.add("suki-edge-label");
+    element.append(label);
+  }
+  setAttributes(label, {
+    x: labelX,
+    y: labelY,
+    "text-anchor": "middle",
+    "dominant-baseline": "central",
+  });
+  label.textContent = edge.label;
+  label.toggleAttribute("hidden", !edge.label);
+}
+
+class SukiCircleElement extends HTMLElement {
+  constructor() {
+    super();
+
+    /** @type {SukiGraph} */
+    this.graph = {
+      groups: [
+        { id: "group-5f2a9c1", label: "デザイン", x: 1430, y: 1040, width: GROUP_MIN_WIDTH, height: GROUP_MIN_HEIGHT, color: GROUP_PALETTE[0] },
+        { id: "group-a18d4e2", label: "人", x: 1740, y: 1080, width: GROUP_MIN_WIDTH, height: GROUP_MIN_HEIGHT, color: GROUP_PALETTE[1] },
+      ],
+      nodes: [
+        { id: "node-98ed003", label: "U", x: 1375, y: 1005, groupId: "group-5f2a9c1", color: NODE_PALETTE[1] },
+        { id: "node-74b0a6f", label: "色", x: 1490, y: 1070, groupId: "group-5f2a9c1", color: NODE_PALETTE[2] },
+        { id: "node-c31e8b4", label: "自", x: 1700, y: 1040, groupId: "group-a18d4e2", color: NODE_PALETTE[3] },
+        { id: "node-0d9fa73", label: "友", x: 1800, y: 1110, groupId: "group-a18d4e2", color: NODE_PALETTE[4] },
+      ],
+      edges: [
+        { id: "edge-e4a19c8", sourceId: "node-98ed003", targetId: "node-c31e8b4", label: "", type: "related", color: DEFAULT_EDGE_COLOR },
+      ],
+      customCss: "",
+    };
+
+    /** @type {SukiTool} */
+    this.tool = "select";
+    /** @type {string | null} */
+    this.selectedId = "node-98ed003";
+    /** @type {string | null} */
+    this.pendingConnectionId = null;
+    /** @type {string | null} */
+    this.visibleNodeActionId = null;
+    /** @type {string | null} */
+    this.pointerDownSelectedId = null;
+    /** @type {string | null} */
+    this.suppressNextEntityClickId = null;
+    updateGroupGeometry(this.graph);
+
+    /** @type {{ graph: SukiGraph, selectedId: string | null, pendingConnectionId: string | null, visibleNodeActionId: string | null, viewBox: { x: number, y: number, width: number, height: number, initialized: boolean } }[]} */
+    this.undoStack = [];
+    /** @type {{ id: string, startX: number, startY: number, previousX: number, previousY: number, previousTime: number, lastSpeed: number, startTime: number, entityX: number, entityY: number, memberStarts: { id: string, x: number, y: number }[], originalGroupId: string | null, originalGroupBox: { left: number, top: number, width: number, height: number } | null, groupBoxes: { id: string, left: number, top: number, width: number, height: number }[], proposedGroupNodeId: string | null, ejected: boolean, active: boolean, historySaved: boolean } | null} */
+    this.drag = null;
+    /** @type {{ x: number, y: number, width: number, height: number, initialized: boolean }} */
+    this.viewBox = { x: 0, y: 0, width: 0, height: 0, initialized: false };
+    /** @type {{ startX: number, startY: number, viewX: number, viewY: number, moved: boolean } | null} */
+    this.pan = null;
+    this.suppressNextCanvasClick = false;
+    /** @type {{ time: number, x: number, y: number } | null} */
+    this.lastCanvasTap = null;
+    /** @type {string | null} */
+    this.editingNodeId = null;
+    /** @type {{ id: string, time: number, x: number, y: number, count: number } | null} */
+    this.lastNodeTap = null;
+    this.suppressNextClickAfterEditing = false;
+    /** @type {ResizeObserver | null} */
+    this.resizeObserver = null;
+    this.skipNextRenderAnimation = false;
+    this.recreateNextRender = false;
+    this.recreateCanvasNextRender = false;
+  }
+
+  connectedCallback() {
+    this.innerHTML = `
+      <section class="suki-shell" aria-label="スキサークル">
+        <header class="suki-toolbar">
+          <strong>スキサークル</strong>
+          <div class="suki-tool-buttons" role="group" aria-label="ツール">
+            <button type="button" data-tool="select">選択</button>
+          </div>
+          <button type="button" data-action="layout">自動配置</button>
+          <button type="button" data-action="open-custom-css">CSS</button>
+          <button type="button" data-action="export">JSON保存</button>
+          <button type="button" data-action="export-svg">SVG保存</button>
+          <label class="suki-file-button">
+            JSON読込
+            <input type="file" accept="application/json" data-action="import" />
+          </label>
+        </header>
+        <div class="suki-workspace">
+          <svg class="suki-canvas" tabindex="0" aria-label="相関図キャンバス" xmlns="${SVG_NS}">
+            <g class="suki-viewport">
+              <g class="suki-groups"></g>
+              <g class="suki-edges"></g>
+              <g class="suki-edge-hit-areas"></g>
+              <g class="suki-nodes"></g>
+              <g class="suki-edge-labels"></g>
+              <g class="suki-node-actions"></g>
+            </g>
+          </svg>
+          <div class="suki-node-editor" contenteditable="true" role="textbox" aria-label="文字編集" hidden></div>
+          <input class="suki-node-color-input" type="color" data-action="node-color-picker" aria-label="色変更" />
+          <style class="suki-custom-css"></style>
+          <dialog class="suki-properties-dialog" aria-label="プロパティ">
+            <form class="suki-form" method="dialog" hidden>
+              <div class="suki-dialog-header">
+                <h2>プロパティ</h2>
+                <button type="button" data-action="close-properties" aria-label="閉じる">×</button>
+              </div>
+              <div class="suki-id-field"><span>ID</span><output name="entityId"></output></div>
+              <label class="suki-label-field"><span>名前</span><input name="label" /></label>
+              <label>色<input name="color" type="color" /></label>
+              <label class="suki-group-field">所属<select name="groupId"></select></label>
+              <button type="button" data-action="delete">削除</button>
+            </form>
+            <div class="suki-empty">要素を選択してください</div>
+          </dialog>
+          <dialog class="suki-custom-css-dialog" aria-label="カスタムCSS">
+            <form class="suki-custom-css-form" method="dialog">
+              <div class="suki-dialog-header">
+                <h2>カスタムCSS</h2>
+                <button type="button" data-action="close-custom-css" aria-label="閉じる">×</button>
+              </div>
+              <textarea name="customCss" spellcheck="false" placeholder="#node-98ed003 .suki-node-circle { stroke: #172026; }&#10;#edge-e4a19c8-label .suki-edge-label-background { fill: #fff2c2; }"></textarea>
+              <div class="suki-custom-css-actions">
+                <button type="button" data-action="reset-custom-css">リセット</button>
+                <button type="button" data-action="apply-custom-css">適用</button>
+              </div>
+            </form>
+          </dialog>
+        </div>
+        <button class="suki-undo-button" type="button" data-action="undo">元に戻す</button>
+      </section>
+    `;
+
+    this.addEventListener("click", this);
+    this.addEventListener("dblclick", this);
+    this.addEventListener("input", this);
+    this.addEventListener("change", this);
+    this.addEventListener("pointerdown", this);
+    window.addEventListener("pointermove", this);
+    window.addEventListener("pointerup", this);
+    this.resizeObserver = new ResizeObserver(() => {
+      this.updateCanvasViewBox();
+    });
+    this.resizeObserver.observe(this.getCanvas());
+    this.applyCustomCss();
+    this.skipNextRenderAnimation = true;
+    this.recreateNextRender = true;
+    this.render();
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener("pointermove", this);
+    window.removeEventListener("pointerup", this);
+    this.resizeObserver?.disconnect();
+  }
+
+  /**
+   * @param {Event} event
+   */
+  handleEvent(event) {
+    if (event.type === "click") this.onClick(event);
+    if (event.type === "dblclick") this.onDoubleClick(event);
+    if (event.type === "input") this.onInput(event);
+    if (event.type === "change") this.onChange(event);
+    if (event.type === "pointerdown") this.onPointerDown(event);
+    if (event.type === "pointermove") this.onPointerMove(event);
+    if (event.type === "pointerup") this.onPointerUp(event);
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onClick(event) {
+    const target = /** @type {Element} */ (event.target);
+    if (target.closest(".suki-node-editor")) return;
+    if (this.suppressNextClickAfterEditing) {
+      this.suppressNextClickAfterEditing = false;
+      return;
+    }
+
+    const toolButton = target.closest("[data-tool]");
+    const actionButton = target.closest("[data-action]");
+    const entity = target.closest("[data-entity-kind]");
+
+    if (this.suppressNextCanvasClick && target.closest(".suki-canvas") && !toolButton && !actionButton && !entity) {
+      this.suppressNextCanvasClick = false;
+      return;
+    }
+
+    if (toolButton instanceof HTMLElement) {
+      this.tool = /** @type {SukiTool} */ (toolButton.dataset.tool);
+      this.pendingConnectionId = null;
+      this.visibleNodeActionId = null;
+      this.lastCanvasTap = null;
+      this.lastNodeTap = null;
+      this.render();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "start-connect") {
+      this.startConnectionFromSelectedNode();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "change-node-color") {
+      this.openNodeColorPicker(actionButton.dataset.id || null, actionButton);
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "change-edge-color") {
+      this.openEdgeColorPicker(actionButton.dataset.id || null, actionButton);
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "change-group-color") {
+      this.openGroupColorPicker(actionButton.dataset.id || null, actionButton);
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "open-properties") {
+      this.selectedId = actionButton.dataset.id || this.selectedId;
+      this.visibleNodeActionId = null;
+      this.openPropertiesDialog();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "close-properties") {
+      this.closePropertiesDialog();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "open-custom-css") {
+      this.openCustomCssDialog();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "close-custom-css") {
+      this.closeCustomCssDialog();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "apply-custom-css") {
+      this.saveCustomCssFromDialog();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "reset-custom-css") {
+      this.resetCustomCssInDialog();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "undo") {
+      this.undo();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "delete-node") {
+      this.selectedId = actionButton.dataset.id || this.selectedId;
+      this.deleteSelected();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "layout") {
+      this.updateCanvasViewBox();
+      this.pushUndoSnapshot();
+      this.graph = autoLayout(this.graph, {
+        x: this.viewBox.x,
+        y: this.viewBox.y,
+        width: this.viewBox.width,
+        height: this.viewBox.height,
+      });
+      this.render();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "export") {
+      this.exportJson();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "export-svg") {
+      this.exportSvg();
+      return;
+    }
+
+    if (actionButton instanceof Element && actionButton.dataset.action === "delete") {
+      this.selectedId = actionButton.dataset.id || this.selectedId;
+      this.deleteSelected();
+      return;
+    }
+
+    if (entity instanceof SVGElement && entity.dataset.id) {
+      if (this.suppressNextEntityClickId === entity.dataset.id) {
+        this.suppressNextEntityClickId = null;
+        return;
+      }
+      this.lastCanvasTap = null;
+      this.lastNodeTap = null;
+      this.selectEntity(entity.dataset.id);
+      return;
+    }
+
+    if (target.closest(".suki-canvas")) {
+      if (this.suppressNextCanvasClick) {
+        this.suppressNextCanvasClick = false;
+        return;
+      }
+      this.onCanvasClick(/** @type {PointerEvent} */ (event));
+    }
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onDoubleClick(event) {
+    event.preventDefault();
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onInput(event) {
+    const input = /** @type {HTMLInputElement | HTMLSelectElement} */ (event.target);
+    if (input instanceof HTMLInputElement && input.dataset.action === "node-color-picker") {
+      this.applyPickedColor(input);
+      return;
+    }
+
+    const entity = this.selectedId ? findEntity(this.graph, this.selectedId) : null;
+    if (!entity || !input.name) return;
+
+    this.pushUndoSnapshot();
+    if (input.name === "label") {
+      const kind = getEntityKind(this.graph, entity);
+      entity.label = kind === "node" ? input.value.trim().slice(0, 1) : input.value;
+    }
+    if (input.name === "color") {
+      const kind = getEntityKind(this.graph, entity);
+      if (kind === "edge") {
+        /** @type {SukiEdge} */ (entity).color = input.value;
+      } else if ("color" in entity) {
+        entity.color = input.value;
+      }
+    }
+    if (input.name === "groupId" && "groupId" in entity) entity.groupId = input.value || null;
+    this.render();
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onChange(event) {
+    const input = /** @type {HTMLInputElement} */ (event.target);
+    if (input.dataset.action === "node-color-picker") {
+      this.applyPickedColor(input);
+      return;
+    }
+
+    if (input.dataset.action !== "import" || !input.files?.[0]) return;
+
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      try {
+        const nextGraph = JSON.parse(String(reader.result));
+        this.pushUndoSnapshot();
+        this.graph = nextGraph;
+        this.graph.customCss ||= "";
+        this.selectedId = null;
+        this.pendingConnectionId = null;
+        this.visibleNodeActionId = null;
+        this.applyCustomCss();
+        this.render();
+      } catch {
+        alert("JSONを読み込めませんでした。");
+      }
+    });
+    reader.readAsText(input.files[0]);
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onPointerDown(event) {
+    const pointer = /** @type {PointerEvent} */ (event);
+    const target = /** @type {Element} */ (event.target);
+    if (this.editingNodeId) {
+      if (target.closest(".suki-node-editor")) return;
+      pointer.preventDefault();
+      this.commitNodeEditing();
+      this.suppressNextClickAfterEditing = true;
+      return;
+    }
+
+    const actionButton = target.closest("[data-action]");
+    const entityElement = target.closest("[data-entity-kind]");
+    this.pointerDownSelectedId = null;
+    if (this.pendingConnectionId) {
+      if (entityElement instanceof SVGElement && entityElement.dataset.id) {
+        const node = this.graph.nodes.find((item) => item.id === entityElement.dataset.id);
+        pointer.preventDefault();
+        if (node) {
+          this.selectEntity(entityElement.dataset.id);
+        } else {
+          this.pendingConnectionId = null;
+          this.visibleNodeActionId = null;
+          this.render();
+        }
+        return;
+      }
+      if (target.closest(".suki-canvas") && !actionButton) {
+        pointer.preventDefault();
+        this.pendingConnectionId = null;
+        this.visibleNodeActionId = null;
+        this.render();
+      }
+      return;
+    }
+    if (!(entityElement instanceof SVGElement) || !entityElement.dataset.id || this.tool !== "select") {
+      if (target.closest(".suki-canvas") && !entityElement && !actionButton) {
+        this.lastNodeTap = null;
+        this.startCanvasPan(pointer);
+      }
+      return;
+    }
+
+    const entity = findEntity(this.graph, entityElement.dataset.id);
+    if (!entity) return;
+    const entityKind = getEntityKind(this.graph, entity);
+    if (entityKind === "edge") {
+      pointer.preventDefault();
+      this.suppressNextEntityClickId = entity.id;
+      if (this.consumeNodeEditTap(entity.id, pointer.clientX, pointer.clientY)) {
+        this.startNodeEditing(entity.id);
+      } else {
+        this.selectEntity(entity.id);
+      }
+      return;
+    }
+
+    pointer.preventDefault();
+    if ((entityKind === "node" || entityKind === "group") && this.consumeNodeEditTap(entity.id, pointer.clientX, pointer.clientY)) {
+      this.startNodeEditing(entity.id);
+      return;
+    }
+
+    entityElement.setPointerCapture(pointer.pointerId);
+    this.pointerDownSelectedId = this.selectedId;
+    const entityIsNode = entityKind === "node";
+    this.visibleNodeActionId = entityIsNode && this.selectedId === entity.id ? entity.id : null;
+    const originalGroup = "groupId" in entity && entity.groupId
+      ? this.graph.groups.find((group) => group.id === entity.groupId) || null
+      : null;
+    this.selectedId = entity.id;
+    this.drag = {
+      id: entity.id,
+      startX: pointer.clientX,
+      startY: pointer.clientY,
+      previousX: pointer.clientX,
+      previousY: pointer.clientY,
+      previousTime: performance.now(),
+      lastSpeed: 0,
+      startTime: performance.now(),
+      entityX: entity.x,
+      entityY: entity.y,
+      memberStarts: getEntityKind(this.graph, entity) === "group"
+        ? getGroupMembers(this.graph, entity.id).map((node) => ({ id: node.id, x: node.x, y: node.y }))
+        : [],
+      originalGroupId: originalGroup?.id || null,
+      originalGroupBox: originalGroup ? getGroupBox(originalGroup) : null,
+      groupBoxes: this.graph.groups.map((group) => ({ id: group.id, ...getGroupBox(group) })),
+      proposedGroupNodeId: null,
+      ejected: false,
+      active: false,
+      historySaved: false,
+    };
+    this.render();
+  }
+
+  /**
+   * @param {number} clientX
+   * @param {number} clientY
+   */
+  applyDragUpdate(clientX, clientY) {
+    if (!this.drag) return;
+
+    const entity = findEntity(this.graph, this.drag.id);
+    if (!entity) return;
+    const now = performance.now();
+    const elapsed = Math.max(1, now - this.drag.previousTime);
+    this.drag.lastSpeed = Math.hypot(clientX - this.drag.previousX, clientY - this.drag.previousY) / elapsed;
+    this.drag.previousX = clientX;
+    this.drag.previousY = clientY;
+    this.drag.previousTime = now;
+
+    const dx = clientX - this.drag.startX;
+    const dy = clientY - this.drag.startY;
+    if (!this.drag.active) {
+      if (Math.hypot(dx, dy) < DRAG_START_THRESHOLD) return;
+      this.drag.active = true;
+      if (!this.drag.historySaved) {
+        this.pushUndoSnapshot();
+        this.drag.historySaved = true;
+      }
+      this.visibleNodeActionId = null;
+      this.pointerDownSelectedId = null;
+      this.suppressNextCanvasClick = true;
+    }
+
+    entity.x = this.drag.entityX + dx;
+    entity.y = this.drag.entityY + dy;
+    this.drag.memberStarts.forEach((start) => {
+      const node = this.graph.nodes.find((item) => item.id === start.id);
+      if (!node) return;
+      node.x = start.x + dx;
+      node.y = start.y + dy;
+    });
+    const membershipChanged = this.updateDraggedNodeMembership(entity);
+    this.updateDraftGroupCandidate(entity);
+    this.render({ freezeGroups: membershipChanged });
+    if (membershipChanged) this.render();
+  }
+
+  /**
+   * @param {SukiEntity} entity
+   * @returns {boolean}
+   */
+  updateDraggedNodeMembership(entity) {
+    if (!this.drag || !("groupId" in entity)) {
+      return false;
+    }
+
+    const containingGroupBox = this.drag.groupBoxes.find((box) => {
+      return isPointInsideBox(box, entity.x, entity.y);
+    });
+    if (containingGroupBox && !entity.groupId) {
+      entity.groupId = containingGroupBox.id;
+      this.drag.ejected = false;
+      return true;
+    }
+
+    if (
+      !this.drag.ejected
+      && entity.groupId
+      && this.drag.originalGroupId
+      && this.drag.originalGroupBox
+      && this.drag.lastSpeed >= NODE_EJECT_SPEED
+      && !isPointInsideBox(this.drag.originalGroupBox, entity.x, entity.y, NODE_EJECT_MARGIN)
+    ) {
+      if (getGroupMembers(this.graph, entity.groupId).length <= 1) return false;
+      entity.groupId = null;
+      this.drag.ejected = true;
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * @param {SukiEntity} entity
+   */
+  updateDraftGroupCandidate(entity) {
+    if (!this.drag || !("groupId" in entity)) return;
+    if (entity.groupId) {
+      this.drag.proposedGroupNodeId = null;
+      return;
+    }
+
+    const nearest = this.graph.nodes
+      .filter((node) => node.id !== entity.id && !node.groupId)
+      .map((node) => ({
+        node,
+        distance: Math.hypot(node.x - entity.x, node.y - entity.y),
+      }))
+      .sort((left, right) => {
+        if (left.distance !== right.distance) return left.distance - right.distance;
+        return left.node.id.localeCompare(right.node.id);
+      })[0];
+
+    this.drag.proposedGroupNodeId = nearest && nearest.distance <= NODE_SIZE
+      ? nearest.node.id
+      : null;
+  }
+
+  commitDraftGroup() {
+    if (!this.drag?.proposedGroupNodeId) return;
+
+    const draggedNode = this.graph.nodes.find((node) => node.id === this.drag?.id);
+    const pairedNode = this.graph.nodes.find((node) => node.id === this.drag?.proposedGroupNodeId);
+    if (!draggedNode || !pairedNode || draggedNode.groupId || pairedNode.groupId) return;
+    if (Math.hypot(pairedNode.x - draggedNode.x, pairedNode.y - draggedNode.y) > NODE_SIZE) return;
+    if (!this.drag.historySaved) {
+      this.pushUndoSnapshot();
+      this.drag.historySaved = true;
+    }
+
+    const group = {
+      id: makeUniqueId(this.graph, "group"),
+      label: `グループ${this.graph.groups.length + 1}`,
+      x: 0,
+      y: 0,
+      width: GROUP_MIN_WIDTH,
+      height: GROUP_MIN_HEIGHT,
+      color: GROUP_PALETTE[this.graph.groups.length % GROUP_PALETTE.length],
+    };
+    this.graph.groups.push(group);
+    draggedNode.groupId = group.id;
+    pairedNode.groupId = group.id;
+    Object.assign(group, getGroupGeometryForMembers([draggedNode, pairedNode]));
+    this.selectedId = group.id;
+    this.visibleNodeActionId = null;
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onPointerMove(event) {
+    const pointer = /** @type {PointerEvent} */ (event);
+    if (this.pan) {
+      this.applyCanvasPan(pointer.clientX, pointer.clientY);
+      return;
+    }
+    if (!this.drag) return;
+
+    this.applyDragUpdate(pointer.clientX, pointer.clientY);
+  }
+
+  /**
+   * @param {Event} event
+   */
+  onPointerUp(event) {
+    const pointer = /** @type {PointerEvent} */ (event);
+    if (this.pan) {
+      this.applyCanvasPan(pointer.clientX, pointer.clientY);
+      this.suppressNextCanvasClick = this.pan.moved;
+      this.pan = null;
+      this.getCanvas().classList.remove("is-panning");
+      return;
+    }
+    if (!this.drag) return;
+
+    this.applyDragUpdate(pointer.clientX, pointer.clientY);
+    if (this.drag.active) {
+      this.commitDraftGroup();
+      this.pointerDownSelectedId = null;
+      this.suppressNextCanvasClick = true;
+    } else {
+      this.suppressNextEntityClickId = this.drag.id;
+      this.pointerDownSelectedId = null;
+      this.drag = null;
+      return;
+    }
+    this.pointerDownSelectedId = null;
+    this.drag = null;
+    this.render();
+  }
+
+  /**
+   * @param {PointerEvent} pointer
+   */
+  startCanvasPan(pointer) {
+    const canvas = this.getCanvas();
+    this.updateCanvasViewBox();
+    pointer.preventDefault();
+    canvas.setPointerCapture(pointer.pointerId);
+    canvas.classList.add("is-panning");
+    this.pan = {
+      startX: pointer.clientX,
+      startY: pointer.clientY,
+      viewX: this.viewBox.x,
+      viewY: this.viewBox.y,
+      moved: false,
+    };
+  }
+
+  /**
+   * @param {number} clientX
+   * @param {number} clientY
+   */
+  applyCanvasPan(clientX, clientY) {
+    if (!this.pan) return;
+
+    const canvas = this.getCanvas();
+    const scaleX = this.viewBox.width / Math.max(1, canvas.clientWidth);
+    const scaleY = this.viewBox.height / Math.max(1, canvas.clientHeight);
+    const dx = clientX - this.pan.startX;
+    const dy = clientY - this.pan.startY;
+    if (!this.pan.moved && Math.hypot(dx, dy) < DRAG_START_THRESHOLD) return;
+    if (!this.pan.moved) {
+      this.pan.moved = true;
+      this.suppressNextCanvasClick = true;
+    }
+
+    this.viewBox.x = this.clampViewBoxX(this.pan.viewX - dx * scaleX);
+    this.viewBox.y = this.clampViewBoxY(this.pan.viewY - dy * scaleY);
+    this.applyCanvasViewBox();
+  }
+
+  /**
+   * @param {PointerEvent} event
+   */
+  onCanvasClick(event) {
+    if (this.pendingConnectionId) {
+      this.pendingConnectionId = null;
+      this.lastCanvasTap = null;
+      this.render();
+      return;
+    }
+
+    const point = this.getCanvasPoint(event);
+    if (this.tool === "select" && this.consumeCanvasDoubleTap(point.x, point.y)) {
+      this.addNodeAt(point.x, point.y);
+      return;
+    }
+
+    if (this.tool === "node") {
+      this.lastCanvasTap = null;
+      this.addNodeAt(point.x, point.y);
+      return;
+    }
+
+    if (this.tool === "group") {
+      this.lastCanvasTap = null;
+      this.pushUndoSnapshot();
+      const group = {
+        id: makeUniqueId(this.graph, "group"),
+        label: `グループ${this.graph.groups.length + 1}`,
+        x: point.x,
+        y: point.y,
+        width: GROUP_MIN_WIDTH,
+        height: GROUP_MIN_HEIGHT,
+        color: GROUP_PALETTE[this.graph.groups.length % GROUP_PALETTE.length],
+      };
+      this.graph.groups.push(group);
+      this.selectedId = group.id;
+      this.visibleNodeActionId = null;
+      this.render();
+      return;
+    }
+
+    this.selectedId = null;
+    this.pendingConnectionId = null;
+    this.visibleNodeActionId = null;
+    this.render();
+  }
+
+  /**
+   * @param {number} x
+   * @param {number} y
+   * @returns {boolean}
+   */
+  consumeCanvasDoubleTap(x, y) {
+    const now = performance.now();
+    const previous = this.lastCanvasTap;
+    this.lastCanvasTap = { time: now, x, y };
+    if (!previous) return false;
+
+    const elapsed = now - previous.time;
+    const distance = Math.hypot(x - previous.x, y - previous.y);
+    if (elapsed > DOUBLE_TAP_MS || distance > DOUBLE_TAP_DISTANCE) return false;
+
+    this.lastCanvasTap = null;
+    return true;
+  }
+
+  /**
+   * @param {string} id
+   * @param {number} x
+   * @param {number} y
+   * @returns {boolean}
+   */
+  consumeNodeEditTap(id, x, y) {
+    const now = performance.now();
+    const previous = this.lastNodeTap;
+    if (!previous || previous.id !== id) {
+      this.lastNodeTap = { id, time: now, x, y, count: 1 };
+      return false;
+    }
+
+    const elapsed = now - previous.time;
+    const distance = Math.hypot(x - previous.x, y - previous.y);
+    if (elapsed > DOUBLE_TAP_MS || distance > DOUBLE_TAP_DISTANCE) {
+      this.lastNodeTap = { id, time: now, x, y, count: 1 };
+      return false;
+    }
+
+    const count = previous.count + 1;
+    this.lastNodeTap = { id, time: now, x, y, count };
+    if (count < NODE_EDIT_TAP_COUNT) return false;
+
+    this.lastNodeTap = null;
+    return true;
+  }
+
+  /**
+   * @param {number} x
+   * @param {number} y
+   */
+  addNodeAt(x, y) {
+    const group = this.findGroupAt(x, y);
+    this.pushUndoSnapshot();
+    const node = {
+      id: makeUniqueId(this.graph, "node"),
+      label: randomNodeLabel(),
+      x,
+      y,
+      groupId: group?.id || null,
+      color: randomPastelColor(),
+    };
+    this.graph.nodes.push(node);
+    this.selectedId = node.id;
+    this.visibleNodeActionId = null;
+    this.render();
+  }
+
+  /**
+   * @param {string} id
+   */
+  selectEntity(id) {
+    const node = this.graph.nodes.find((item) => item.id === id);
+    const entity = findEntity(this.graph, id);
+    this.lastCanvasTap = null;
+    if (this.pendingConnectionId) {
+      if (node && this.pendingConnectionId !== id && !hasEdge(this.graph, this.pendingConnectionId, id)) {
+        this.pushUndoSnapshot();
+        this.graph.edges.push({
+          id: makeUniqueId(this.graph, "edge"),
+          sourceId: this.pendingConnectionId,
+          targetId: id,
+          label: "",
+          type: "related",
+          color: DEFAULT_EDGE_COLOR,
+        });
+      }
+      this.pendingConnectionId = null;
+      this.selectedId = id;
+      this.visibleNodeActionId = null;
+      this.pointerDownSelectedId = null;
+      this.render();
+      return;
+    }
+
+    this.selectedId = id;
+    if (!node || (entity && getEntityKind(this.graph, entity) === "edge")) this.visibleNodeActionId = null;
+    this.pointerDownSelectedId = null;
+    this.render();
+  }
+
+  startConnectionFromSelectedNode() {
+    const node = this.selectedId ? this.graph.nodes.find((item) => item.id === this.selectedId) : null;
+    if (!node) return;
+    this.tool = "select";
+    this.pendingConnectionId = node.id;
+    this.visibleNodeActionId = null;
+    this.render();
+  }
+
+  /**
+   * @param {string | null} id
+   * @param {Element} anchor
+   */
+  openNodeColorPicker(id, anchor) {
+    const node = id ? this.graph.nodes.find((item) => item.id === id) : null;
+    if (!node) return;
+    this.openColorPicker("node", node.id, node.color, anchor);
+  }
+
+  /**
+   * @param {string | null} id
+   * @param {Element} anchor
+   */
+  openEdgeColorPicker(id, anchor) {
+    const edge = id ? this.graph.edges.find((item) => item.id === id) : null;
+    if (!edge) return;
+    this.openColorPicker("edge", edge.id, getEdgeColor(edge), anchor);
+  }
+
+  /**
+   * @param {string | null} id
+   * @param {Element} anchor
+   */
+  openGroupColorPicker(id, anchor) {
+    const group = id ? this.graph.groups.find((item) => item.id === id) : null;
+    if (!group) return;
+    this.openColorPicker("group", group.id, group.color, anchor);
+  }
+
+  /**
+   * @param {"node" | "edge" | "group"} kind
+   * @param {string} id
+   * @param {string} color
+   * @param {Element} anchor
+   */
+  openColorPicker(kind, id, color, anchor) {
+    const input = this.querySelector(".suki-node-color-input");
+    if (!(input instanceof HTMLInputElement)) return;
+
+    const swatch = anchor.querySelector(".suki-node-color-action-swatch");
+    const rect = (swatch || anchor).getBoundingClientRect();
+    input.dataset.entityKind = kind;
+    input.dataset.entityId = id;
+    input.value = color;
+    input.style.left = `${rect.left}px`;
+    input.style.top = `${rect.top}px`;
+    input.style.inlineSize = `${Math.max(1, rect.width)}px`;
+    input.style.blockSize = `${Math.max(1, rect.height)}px`;
+    input.getBoundingClientRect();
+    input.focus({ preventScroll: true });
+    if ("showPicker" in input) {
+      input.showPicker();
+    } else {
+      input.click();
+    }
+  }
+
+  /**
+   * @param {HTMLInputElement} input
+   */
+  applyPickedColor(input) {
+    const id = input.dataset.entityId;
+    const kind = input.dataset.entityKind;
+    if (!id) return;
+
+    if (kind === "edge") {
+      const edge = this.graph.edges.find((item) => item.id === id);
+      if (!edge) return;
+      this.pushUndoSnapshot();
+      edge.color = input.value;
+      this.selectedId = edge.id;
+      this.visibleNodeActionId = null;
+      this.render();
+      return;
+    }
+
+    if (kind === "group") {
+      const group = this.graph.groups.find((item) => item.id === id);
+      if (!group) return;
+      this.pushUndoSnapshot();
+      group.color = input.value;
+      this.selectedId = group.id;
+      this.visibleNodeActionId = null;
+      this.render();
+      return;
+    }
+
+    const node = this.graph.nodes.find((item) => item.id === id);
+    if (!node) return;
+    this.pushUndoSnapshot();
+    node.color = input.value;
+    this.selectedId = node.id;
+    this.visibleNodeActionId = node.id;
+    this.render();
+  }
+
+  openPropertiesDialog() {
+    const dialog = this.querySelector(".suki-properties-dialog");
+    if (!(dialog instanceof HTMLDialogElement)) return;
+    this.renderInspector();
+    if (!dialog.open) dialog.showModal();
+  }
+
+  closePropertiesDialog() {
+    const dialog = this.querySelector(".suki-properties-dialog");
+    if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
+  }
+
+  createHistorySnapshot() {
+    return {
+      graph: cloneGraph(this.graph),
+      selectedId: this.selectedId,
+      pendingConnectionId: this.pendingConnectionId,
+      visibleNodeActionId: this.visibleNodeActionId,
+      viewBox: { ...this.viewBox },
+    };
+  }
+
+  pushUndoSnapshot() {
+    const snapshot = this.createHistorySnapshot();
+    const previous = this.undoStack[this.undoStack.length - 1];
+    if (previous && JSON.stringify(previous) === JSON.stringify(snapshot)) return;
+    this.undoStack.push(snapshot);
+    if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift();
+    this.updateUndoButton();
+  }
+
+  updateUndoButton() {
+    const undoButton = this.querySelector('[data-action="undo"]');
+    if (undoButton instanceof HTMLButtonElement) undoButton.disabled = this.undoStack.length === 0;
+  }
+
+  undo() {
+    const snapshot = this.undoStack.pop();
+    if (!snapshot) return;
+
+    this.graph = cloneGraph(snapshot.graph);
+    this.selectedId = snapshot.selectedId;
+    this.pendingConnectionId = snapshot.pendingConnectionId;
+    this.visibleNodeActionId = snapshot.visibleNodeActionId;
+    this.viewBox = { ...snapshot.viewBox };
+    this.drag = null;
+    this.pan = null;
+    this.editingNodeId = null;
+    this.lastCanvasTap = null;
+    this.lastNodeTap = null;
+    const editor = this.getNodeEditor();
+    if (editor) {
+      editor.hidden = true;
+      editor.textContent = "";
+      editor.classList.remove("is-group-editor", "is-node-editor", "is-edge-editor");
+    }
+    this.applyCustomCss();
+    this.skipNextRenderAnimation = true;
+    this.recreateCanvasNextRender = true;
+    this.render();
+  }
+
+  applyCustomCss() {
+    const style = this.querySelector(".suki-custom-css");
+    if (!(style instanceof HTMLStyleElement)) return;
+    style.textContent = this.graph.customCss || "";
+  }
+
+  openCustomCssDialog() {
+    const dialog = this.querySelector(".suki-custom-css-dialog");
+    const textarea = this.querySelector(".suki-custom-css-form textarea");
+    if (!(dialog instanceof HTMLDialogElement) || !(textarea instanceof HTMLTextAreaElement)) return;
+    textarea.value = this.graph.customCss || "";
+    if (!dialog.open) dialog.showModal();
+    textarea.focus();
+  }
+
+  closeCustomCssDialog() {
+    const dialog = this.querySelector(".suki-custom-css-dialog");
+    if (dialog instanceof HTMLDialogElement && dialog.open) dialog.close();
+  }
+
+  saveCustomCssFromDialog() {
+    const textarea = this.querySelector(".suki-custom-css-form textarea");
+    if (!(textarea instanceof HTMLTextAreaElement)) return;
+    this.pushUndoSnapshot();
+    this.graph.customCss = textarea.value;
+    this.applyCustomCss();
+    this.closeCustomCssDialog();
+  }
+
+  resetCustomCssInDialog() {
+    const textarea = this.querySelector(".suki-custom-css-form textarea");
+    if (!(textarea instanceof HTMLTextAreaElement)) return;
+    this.pushUndoSnapshot();
+    textarea.value = this.createCustomCssTemplate();
+    this.graph.customCss = textarea.value;
+    this.applyCustomCss();
+  }
+
+  /**
+   * @returns {string}
+   */
+  createCustomCssTemplate() {
+    const blocks = [];
+    this.graph.nodes.forEach((node) => {
+      blocks.push(this.createCustomCssBlock(node.id, `node: ${node.label}`));
+    });
+    this.graph.groups.forEach((group) => {
+      blocks.push(this.createCustomCssBlock(group.id, `group: ${group.label}`));
+    });
+    this.graph.edges.forEach((edge) => {
+      const source = this.graph.nodes.find((node) => node.id === edge.sourceId);
+      const target = this.graph.nodes.find((node) => node.id === edge.targetId);
+      const sourceLabel = source?.label || edge.sourceId;
+      const targetLabel = target?.label || edge.targetId;
+      blocks.push(this.createCustomCssBlock(edge.id, `edge: ${sourceLabel} - ${targetLabel}`));
+      if (edge.label) blocks.push(this.createCustomCssBlock(`${edge.id}-label`, `edge label: ${edge.label}`));
+    });
+    return `${blocks.join("\n\n")}\n`;
+  }
+
+  /**
+   * @param {string} id
+   * @param {string} comment
+   * @returns {string}
+   */
+  createCustomCssBlock(id, comment) {
+    const safeComment = comment.replace(/\*\//g, "* /").replace(/\r?\n/g, " / ");
+    return `/* ${safeComment} */\n${cssIdSelector(id)} {\n}`;
+  }
+
+  /**
+   * @returns {SukiGroup | null}
+   */
+  getDraftGroup() {
+    if (!this.drag?.proposedGroupNodeId) return null;
+
+    const draggedNode = this.graph.nodes.find((node) => node.id === this.drag?.id);
+    const pairedNode = this.graph.nodes.find((node) => node.id === this.drag?.proposedGroupNodeId);
+    if (!draggedNode || !pairedNode || draggedNode.groupId || pairedNode.groupId) return null;
+    if (Math.hypot(pairedNode.x - draggedNode.x, pairedNode.y - draggedNode.y) > NODE_SIZE) return null;
+
+    return {
+      id: DRAFT_GROUP_ID,
+      label: "新規グループ",
+      color: GROUP_PALETTE[this.graph.groups.length % GROUP_PALETTE.length],
+      ...getGroupGeometryForMembers([draggedNode, pairedNode]),
+    };
+  }
+
+  /**
+   * @param {string} id
+   */
+  startNodeEditing(id) {
+    const entity = findEntity(this.graph, id);
+    const editor = this.getNodeEditor();
+    if (!entity) return;
+    const kind = getEntityKind(this.graph, entity);
+    if (kind !== "node" && kind !== "group" && kind !== "edge") return;
+    if (!editor) return;
+
+    this.editingNodeId = id;
+    this.lastNodeTap = null;
+    this.lastCanvasTap = null;
+    this.selectedId = id;
+    this.pendingConnectionId = null;
+    this.visibleNodeActionId = null;
+    this.drag = null;
+    editor.classList.toggle("is-group-editor", kind === "group");
+    editor.classList.toggle("is-node-editor", kind === "node");
+    editor.classList.toggle("is-edge-editor", kind === "edge");
+    editor.textContent = entity.label;
+    editor.hidden = false;
+    this.render();
+    this.positionNodeEditor();
+    editor.focus();
+
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  }
+
+  commitNodeEditing() {
+    if (!this.editingNodeId) return;
+
+    const entity = findEntity(this.graph, this.editingNodeId);
+    const editor = this.getNodeEditor();
+    const kind = entity ? getEntityKind(this.graph, entity) : null;
+    const rawValue = editor?.innerText || editor?.textContent || "";
+    const value = kind === "group"
+      ? rawValue.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim()
+      : rawValue.replace(/\s+/g, " ").trim();
+    if (entity && (kind === "node" || kind === "group" || kind === "edge")) {
+      this.pushUndoSnapshot();
+      entity.label = kind === "node" ? value.slice(0, 1) : value;
+    }
+
+    this.editingNodeId = null;
+    this.lastNodeTap = null;
+    if (editor) {
+      editor.hidden = true;
+      editor.textContent = "";
+      editor.classList.remove("is-group-editor", "is-node-editor", "is-edge-editor");
+    }
+    this.render();
+  }
+
+  positionNodeEditor() {
+    if (!this.editingNodeId) return;
+
+    const entity = findEntity(this.graph, this.editingNodeId);
+    const editor = this.getNodeEditor();
+    const workspace = this.querySelector(".suki-workspace");
+    if (!entity || !editor || !(workspace instanceof HTMLElement)) return;
+    const kind = getEntityKind(this.graph, entity);
+    if (kind !== "node" && kind !== "group" && kind !== "edge") return;
+
+    const canvas = this.getCanvas();
+    const canvasRect = canvas.getBoundingClientRect();
+    const workspaceRect = workspace.getBoundingClientRect();
+    const scaleX = canvas.clientWidth / Math.max(1, this.viewBox.width);
+    const scaleY = canvas.clientHeight / Math.max(1, this.viewBox.height);
+    if (kind === "node") {
+      const node = /** @type {SukiNode} */ (entity);
+      const size = NODE_SIZE * Math.min(scaleX, scaleY);
+      const x = canvasRect.left - workspaceRect.left + (node.x - this.viewBox.x) * scaleX;
+      const y = canvasRect.top - workspaceRect.top + (node.y - this.viewBox.y) * scaleY;
+      editor.style.inlineSize = `${size}px`;
+      editor.style.blockSize = `${size}px`;
+      editor.style.left = `${x - size / 2}px`;
+      editor.style.top = `${y - size / 2}px`;
+      return;
+    }
+
+    if (kind === "edge") {
+      const edge = /** @type {SukiEdge} */ (entity);
+      const source = this.graph.nodes.find((node) => node.id === edge.sourceId);
+      const target = this.graph.nodes.find((node) => node.id === edge.targetId);
+      if (!source || !target) return;
+      const x = canvasRect.left - workspaceRect.left + ((source.x + target.x) / 2 - this.viewBox.x) * scaleX;
+      const y = canvasRect.top - workspaceRect.top + ((source.y + target.y) / 2 + 16 - this.viewBox.y) * scaleY;
+      editor.style.inlineSize = "9rem";
+      editor.style.blockSize = "2rem";
+      editor.style.left = `${x - 72}px`;
+      editor.style.top = `${y - 16}px`;
+      return;
+    }
+
+    const group = /** @type {SukiGroup} */ (entity);
+    const box = getGroupBox(group);
+    const left = canvasRect.left - workspaceRect.left + (box.left + 12 - this.viewBox.x) * scaleX;
+    const top = canvasRect.top - workspaceRect.top + (box.top + 12 - this.viewBox.y) * scaleY;
+    editor.style.inlineSize = `${Math.max(120, Math.min(260, (box.width - 24) * scaleX))}px`;
+    editor.style.blockSize = `${Math.max(54, Math.min(150, (box.height - 24) * scaleY))}px`;
+    editor.style.left = `${left}px`;
+    editor.style.top = `${top}px`;
+  }
+
+  deleteSelected() {
+    if (!this.selectedId) return;
+    this.pushUndoSnapshot();
+    const id = this.selectedId;
+    this.graph.nodes = this.graph.nodes.filter((node) => node.id !== id);
+    this.graph.groups = this.graph.groups.filter((group) => group.id !== id);
+    this.graph.edges = this.graph.edges.filter((edge) => edge.id !== id && edge.sourceId !== id && edge.targetId !== id);
+    this.graph.nodes.forEach((node) => {
+      if (node.groupId === id) node.groupId = null;
+    });
+    this.selectedId = null;
+    this.pendingConnectionId = null;
+    this.visibleNodeActionId = null;
+    this.render();
+  }
+
+  exportJson() {
+    const blob = new Blob([JSON.stringify(this.graph, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "suki-circle.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  exportSvg() {
+    const canvas = this.getCanvas();
+    const clone = /** @type {SVGSVGElement} */ (canvas.cloneNode(true));
+    clone.setAttribute("width", String(CANVAS_WORLD_WIDTH));
+    clone.setAttribute("height", String(CANVAS_WORLD_HEIGHT));
+    clone.setAttribute("viewBox", `0 0 ${CANVAS_WORLD_WIDTH} ${CANVAS_WORLD_HEIGHT}`);
+    clone.removeAttribute("tabindex");
+    clone.removeAttribute("aria-label");
+    clone.querySelector(".suki-node-actions")?.remove();
+    clone.querySelector(".suki-edge-hit-areas")?.remove();
+
+    clone.querySelectorAll(".suki-node").forEach((element) => {
+      const svg = /** @type {SVGElement} */ (element);
+      if (!svg.dataset.x || !svg.dataset.y) return;
+      svg.setAttribute("transform", `translate(${svg.dataset.x} ${svg.dataset.y})`);
+      svg.removeAttribute("style");
+    });
+    clone.querySelectorAll("[data-suki-animation]").forEach((element) => element.remove());
+    clone.querySelectorAll(".suki-group-box").forEach((element) => {
+      const rect = /** @type {SVGElement} */ (element);
+      if (rect.dataset.x) rect.setAttribute("x", rect.dataset.x);
+      if (rect.dataset.y) rect.setAttribute("y", rect.dataset.y);
+      if (rect.dataset.width) rect.setAttribute("width", rect.dataset.width);
+      if (rect.dataset.height) rect.setAttribute("height", rect.dataset.height);
+      rect.removeAttribute("style");
+    });
+    clone.querySelectorAll(".suki-group-label").forEach((element) => {
+      const text = /** @type {SVGElement} */ (element);
+      if (text.dataset.x) text.setAttribute("x", text.dataset.x);
+      if (text.dataset.y) text.setAttribute("y", text.dataset.y);
+    });
+
+    const style = svgElement("style");
+    style.textContent = `${EXPORTED_SVG_STYLE}\n${this.graph.customCss || ""}`;
+    clone.prepend(style);
+
+    const source = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob([source], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "suki-circle.svg";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /**
+   * @param {{ freezeGroups?: boolean }} options
+   */
+  render(options = {}) {
+    if (this.recreateCanvasNextRender) {
+      this.recreateCanvas();
+      this.recreateCanvasNextRender = false;
+      this.recreateNextRender = false;
+    }
+    const canvas = this.getCanvas();
+    const disableAnimation = this.drag || this.skipNextRenderAnimation;
+    if (disableAnimation) {
+      canvas.classList.add("is-animation-disabled");
+      canvas.querySelectorAll("[data-suki-animation]").forEach((element) => element.remove());
+      canvas.getBoundingClientRect();
+    }
+    if (!options.freezeGroups) updateGroupGeometry(this.graph);
+    this.updateCanvasViewBox();
+
+    this.querySelectorAll("[data-tool]").forEach((button) => {
+      button.classList.toggle("is-active", button instanceof HTMLElement && button.dataset.tool === this.tool);
+    });
+    const undoButton = this.querySelector('[data-action="undo"]');
+    if (undoButton instanceof HTMLButtonElement) undoButton.disabled = this.undoStack.length === 0;
+
+    const groupsLayer = this.querySelector(".suki-groups");
+    const nodesLayer = this.querySelector(".suki-nodes");
+    const edgesLayer = this.querySelector(".suki-edges");
+    const edgeLabelsLayer = this.querySelector(".suki-edge-labels");
+    const edgeHitAreasLayer = this.querySelector(".suki-edge-hit-areas");
+    const nodeActionsLayer = this.querySelector(".suki-node-actions");
+    if (!groupsLayer || !nodesLayer || !edgesLayer || !edgeLabelsLayer || !edgeHitAreasLayer || !nodeActionsLayer) return;
+    if (this.recreateNextRender) {
+      groupsLayer.replaceChildren();
+      nodesLayer.replaceChildren();
+      edgesLayer.replaceChildren();
+      edgeLabelsLayer.replaceChildren();
+      edgeHitAreasLayer.replaceChildren();
+      nodeActionsLayer.replaceChildren();
+      this.recreateNextRender = false;
+    }
+    const moveDuration = disableAnimation ? 0 : MOVE_ANIMATION_MS;
+    const resizeDuration = disableAnimation ? 0 : GROUP_RESIZE_ANIMATION_MS;
+    const shouldRestoreAnimation = this.skipNextRenderAnimation;
+    this.skipNextRenderAnimation = false;
+
+    const draftGroup = this.getDraftGroup();
+    const renderedGroups = draftGroup ? [...this.graph.groups, draftGroup] : this.graph.groups;
+    const groupElements = syncSvgLayerElements(groupsLayer, ".suki-group", "g", renderedGroups.map((group) => group.id));
+    renderedGroups.forEach((group) => {
+      const element = groupElements.get(group.id);
+      if (element) renderSvgGroup(
+        element,
+        group,
+        this.selectedId === group.id,
+        group.id === DRAFT_GROUP_ID || this.pendingConnectionId === group.id,
+        moveDuration,
+        resizeDuration,
+      );
+    });
+
+    const edgeElements = syncSvgLayerElements(edgesLayer, ".suki-edge", "g", this.graph.edges.map((edge) => edge.id));
+    this.graph.edges.forEach((edge) => {
+      const element = edgeElements.get(edge.id);
+      if (element) renderSvgEdge(element, this.graph, edge, this.selectedId === edge.id);
+    });
+
+    const nodeElements = syncSvgLayerElements(nodesLayer, ".suki-node", "g", this.graph.nodes.map((node) => node.id));
+    this.graph.nodes.forEach((node) => {
+      const element = nodeElements.get(node.id);
+      if (element) renderSvgNode(element, node, this.selectedId === node.id, this.pendingConnectionId === node.id, moveDuration);
+    });
+
+    const edgeLabelElements = syncSvgLayerElements(
+      edgeLabelsLayer,
+      ".suki-edge-label-item",
+      "g",
+      this.graph.edges.filter((edge) => edge.label).map((edge) => edge.id),
+    );
+    this.graph.edges.forEach((edge) => {
+      const element = edgeLabelElements.get(edge.id);
+      if (element) renderSvgEdgeLabel(element, this.graph, edge);
+    });
+
+    const edgeHitAreaElements = syncSvgLayerElements(edgeHitAreasLayer, ".suki-edge-hit-area", "g", this.graph.edges.map((edge) => edge.id));
+    this.graph.edges.forEach((edge) => {
+      const element = edgeHitAreaElements.get(edge.id);
+      if (element) renderSvgEdgeHitArea(element, this.graph, edge);
+    });
+
+    const actionNode = this.pendingConnectionId
+      ? null
+      : this.graph.nodes.find((node) => node.id === this.visibleNodeActionId && node.id === this.selectedId) || null;
+    const actionEdge = this.pendingConnectionId
+      ? null
+      : this.graph.edges.find((edge) => edge.id === this.selectedId) || null;
+    const actionGroup = this.pendingConnectionId
+      ? null
+      : this.graph.groups.find((group) => group.id === this.selectedId) || null;
+    const actionIds = actionNode ? [actionNode.id] : actionEdge ? [actionEdge.id] : actionGroup ? [actionGroup.id] : [];
+    const actionElements = syncSvgLayerElements(nodeActionsLayer, ".suki-node-action", "g", actionIds);
+    if (actionNode) {
+      const element = actionElements.get(actionNode.id);
+      if (element) renderSvgNodeAction(element, actionNode);
+    }
+    if (actionEdge) {
+      const element = actionElements.get(actionEdge.id);
+      if (element) renderSvgEdgeDeleteAction(element, this.graph, actionEdge);
+    }
+    if (actionGroup) {
+      const element = actionElements.get(actionGroup.id);
+      if (element) renderSvgGroupAction(element, actionGroup);
+    }
+
+    this.positionNodeEditor();
+    this.renderInspector();
+    if (shouldRestoreAnimation) {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          canvas.classList.remove("is-animation-disabled");
+        });
+      });
+    } else if (!this.drag) {
+      canvas.classList.remove("is-animation-disabled");
+    }
+  }
+
+  renderInspector() {
+    const form = this.querySelector(".suki-form");
+    const empty = this.querySelector(".suki-empty");
+    if (!(form instanceof HTMLFormElement) || !empty) return;
+
+    const entity = this.selectedId ? findEntity(this.graph, this.selectedId) : null;
+    form.hidden = !entity;
+    empty.toggleAttribute("hidden", !!entity);
+    if (!entity) return;
+
+    const kind = getEntityKind(this.graph, entity);
+
+    const entityId = /** @type {HTMLOutputElement} */ (form.elements.namedItem("entityId"));
+    const label = /** @type {HTMLInputElement} */ (form.elements.namedItem("label"));
+    const color = /** @type {HTMLInputElement} */ (form.elements.namedItem("color"));
+    const groupId = /** @type {HTMLSelectElement} */ (form.elements.namedItem("groupId"));
+    const labelField = /** @type {HTMLElement | null} */ (label.closest("label"));
+    const colorField = /** @type {HTMLElement | null} */ (color.closest("label"));
+    const groupField = /** @type {HTMLElement | null} */ (groupId.closest("label"));
+
+    labelField?.toggleAttribute("hidden", false);
+    colorField?.toggleAttribute("hidden", false);
+    groupField?.toggleAttribute("hidden", kind !== "node");
+
+    entityId.textContent = entity.id;
+    label.value = entity.label;
+    label.maxLength = kind === "node" ? 1 : 80;
+    label.placeholder = kind === "node" ? "一文字" : kind === "edge" ? "テキスト" : "名前";
+    labelField?.querySelector("span")?.replaceChildren(kind === "node" ? "表示文字" : kind === "edge" ? "テキスト" : "名前");
+    if (kind === "edge") {
+      color.value = getEdgeColor(/** @type {SukiEdge} */ (entity));
+    } else if ("color" in entity) {
+      color.value = entity.color;
+    }
+
+    if ("groupId" in entity) {
+      groupId.replaceChildren(
+        new Option("なし", ""),
+        ...this.graph.groups.map((group) => new Option(group.label, group.id, false, entity.groupId === group.id)),
+      );
+      groupId.value = entity.groupId || "";
+    }
+  }
+
+  /**
+   * @returns {SVGSVGElement}
+   */
+  getCanvas() {
+    return /** @type {SVGSVGElement} */ (this.querySelector(".suki-canvas"));
+  }
+
+  /**
+   * @returns {HTMLElement | null}
+   */
+  getNodeEditor() {
+    return /** @type {HTMLElement | null} */ (this.querySelector(".suki-node-editor"));
+  }
+
+  /**
+   * @returns {SVGSVGElement}
+   */
+  createCanvasElement() {
+    const canvas = /** @type {SVGSVGElement} */ (svgElement("svg"));
+    canvas.classList.add("suki-canvas");
+    canvas.setAttribute("tabindex", "0");
+    canvas.setAttribute("aria-label", "相関図キャンバス");
+    canvas.setAttribute("xmlns", SVG_NS);
+    canvas.innerHTML = `
+      <g class="suki-viewport">
+        <g class="suki-groups"></g>
+        <g class="suki-edges"></g>
+        <g class="suki-edge-hit-areas"></g>
+        <g class="suki-nodes"></g>
+        <g class="suki-edge-labels"></g>
+        <g class="suki-node-actions"></g>
+      </g>
+    `;
+    return canvas;
+  }
+
+  recreateCanvas() {
+    const current = this.getCanvas();
+    const next = this.createCanvasElement();
+    current.replaceWith(next);
+    if (this.resizeObserver) {
+      this.resizeObserver.unobserve(current);
+      this.resizeObserver.observe(next);
+    }
+  }
+
+  updateCanvasViewBox() {
+    const canvas = this.getCanvas();
+    const width = Math.max(1, Math.round(canvas.clientWidth));
+    const height = Math.max(1, Math.round(canvas.clientHeight));
+
+    if (!this.viewBox.initialized) {
+      this.viewBox.x = Math.max(0, (CANVAS_WORLD_WIDTH - width) / 2);
+      this.viewBox.y = Math.max(0, (CANVAS_WORLD_HEIGHT - height) / 2);
+      this.viewBox.initialized = true;
+    } else {
+      const centerX = this.viewBox.x + this.viewBox.width / 2;
+      const centerY = this.viewBox.y + this.viewBox.height / 2;
+      this.viewBox.x = centerX - width / 2;
+      this.viewBox.y = centerY - height / 2;
+    }
+
+    this.viewBox.width = width;
+    this.viewBox.height = height;
+    this.viewBox.x = this.clampViewBoxX(this.viewBox.x);
+    this.viewBox.y = this.clampViewBoxY(this.viewBox.y);
+    this.applyCanvasViewBox();
+  }
+
+  applyCanvasViewBox() {
+    const canvas = this.getCanvas();
+    canvas.setAttribute("viewBox", `${this.viewBox.x} ${this.viewBox.y} ${this.viewBox.width} ${this.viewBox.height}`);
+    const scaleX = canvas.clientWidth / Math.max(1, this.viewBox.width);
+    const scaleY = canvas.clientHeight / Math.max(1, this.viewBox.height);
+    const gridSizeX = GRID_SIZE * scaleX;
+    const gridSizeY = GRID_SIZE * scaleY;
+    canvas.style.setProperty("--suki-grid-size-x", `${gridSizeX}px`);
+    canvas.style.setProperty("--suki-grid-size-y", `${gridSizeY}px`);
+    canvas.style.setProperty("--suki-grid-x", `${(-this.viewBox.x * scaleX) % gridSizeX}px`);
+    canvas.style.setProperty("--suki-grid-y", `${(-this.viewBox.y * scaleY) % gridSizeY}px`);
+  }
+
+  /**
+   * @param {number} x
+   * @returns {number}
+   */
+  clampViewBoxX(x) {
+    return Math.min(Math.max(0, x), Math.max(0, CANVAS_WORLD_WIDTH - this.viewBox.width));
+  }
+
+  /**
+   * @param {number} y
+   * @returns {number}
+   */
+  clampViewBoxY(y) {
+    return Math.min(Math.max(0, y), Math.max(0, CANVAS_WORLD_HEIGHT - this.viewBox.height));
+  }
+
+  /**
+   * @param {PointerEvent} event
+   * @returns {{ x: number, y: number }}
+   */
+  getCanvasPoint(event) {
+    const canvas = this.getCanvas();
+    const matrix = canvas.getScreenCTM();
+    if (!matrix) {
+      const rect = canvas.getBoundingClientRect();
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    }
+
+    const point = canvas.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const transformed = point.matrixTransform(matrix.inverse());
+    return { x: transformed.x, y: transformed.y };
+  }
+
+  /**
+   * @param {number} x
+   * @param {number} y
+   * @returns {SukiGroup | null}
+   */
+  findGroupAt(x, y) {
+    return this.graph.groups.find((group) => {
+      const box = getGroupBox(group);
+      return isPointInsideBox(box, x, y);
+    }) || null;
+  }
+}
+
+customElements.define("suki-circle", SukiCircleElement);
