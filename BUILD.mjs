@@ -22,7 +22,7 @@ const staticFiles = [
   "umireon-honeycomb-wallpaper.svg",
   "umireon-honeycomb.svg",
   "umireon.css",
-  "うみ基本線.brush",
+  "umireon-senga.brush",
 ];
 
 const source = (await readFile("suki-circle.js", "utf8"))
